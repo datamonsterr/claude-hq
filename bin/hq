@@ -49,10 +49,10 @@ Usage: hq projects [--json]
        hq spawn <project> [-n title] [-w [name]] [--mode mode] [--force] [--] [prompt…]
        hq sessions [project] [-a|--all] [--json]
        hq stop <id>
-       hq cleanup [--idle-hours N] [--json]
+       hq cleanup [--idle-hours N] [-v] [--json]
        hq health [-v] [--json]
        hq capacity
-       hq janitor [--apply]
+       hq janitor [--apply] [-v]
        hq brief [-a|--all]
        hq memory check
 Projects are repositories directly under HQ_ROOTS (colon-separated; default ~/dev).
@@ -277,11 +277,12 @@ cleanup_data() {
 }
 
 cleanup() {
-  local hours=12 json=false data
+  local hours=12 json=false verbose=false data hint=' · up to 3 samples/rule; -v for all'
   while (( $# )); do
     case $1 in
       --idle-hours) (( $# >= 2 )) || die 'missing idle hours'; hours=$2; shift ;;
       --json) json=true ;;
+      -v|--verbose) verbose=true ;;
       *) die "unknown cleanup option: $1" ;;
     esac
     shift
@@ -289,8 +290,15 @@ cleanup() {
   [[ $hours =~ ^[0-9]+([.][0-9]+)?$ ]] || die 'idle hours must be a nonnegative number'
   discover; load_agents all; data=$(cleanup_data "$hours")
   if $json; then printf '%s\n' "$data"; return; fi
-  printf 'Cleanup report only · %s findings · idle candidates use session age\n' "$(jq length <<<"$data")"
-  jq -r '.[] | "\(.kind): \(.summary)",(.commands[] | "  " + .)' <<<"$data"
+  if $verbose; then hint=''; fi
+  printf 'Cleanup report only · %s findings · idle candidates use session age%s\n' "$(jq length <<<"$data")" "$hint"
+  if $verbose; then
+    jq -r '.[] | "\(.kind): \(.summary)",(.commands[] | "  " + .)' <<<"$data"
+  else
+    jq -r 'group_by(.kind)[] | . as $items |
+      (({session:"old done/idle sessions",dirty:"dirty repositories/worktrees",worktree:"merged worktrees",branch:"merged branches"}[.[0].kind])+": "+(length|tostring)),
+      (.[:3][]|"  "+.summary+(if (.commands|length)>0 then " · "+(.commands|join("; ")) else "" end))' <<<"$data"
+  fi
 }
 
 # PocketBase pages, authenticated only in memory. Do not persist credentials/tokens.
@@ -409,7 +417,7 @@ brief() {
       jq -r '[.[]|select(.dirty>0 or .ahead>0)][:6][] | "project \(.name): \(.dirty) dirty, \(.ahead) ahead"' <<<"$PROJECTS"
       load_agents all
       cleanup_count=$(cleanup_data 12 | jq length)
-      printf 'Cleanup: %s findings (hq cleanup)\n' "$cleanup_count"
+      printf 'Cleanup: %s candidates (hq cleanup for full checks)\n' "$cleanup_count"
     fi
     printf 'Next:\n'
     if [[ -f $MEMORY_DIR/MEMORY.md ]]; then
@@ -422,6 +430,10 @@ brief() {
 # Shared repo snapshots and janitor policy contain no persistent session registry.
 # shellcheck source=lib/hq-repos.sh
 source "$HQ_DIR/lib/hq-repos.sh"
+# shellcheck source=lib/hq-agents.sh
+source "$HQ_DIR/lib/hq-agents.sh"
+# shellcheck source=lib/hq-report.sh
+source "$HQ_DIR/lib/hq-report.sh"
 # shellcheck source=lib/hq-capacity.sh
 source "$HQ_DIR/lib/hq-capacity.sh"
 # shellcheck source=lib/hq-janitor.sh

@@ -18,7 +18,8 @@ For graceful stop, use `hq stop <background-id|sessionId-prefix>`: SIGINT twice;
 Do not introduce a session registry, tmux manager, transcript parser, or own purge.
 
 Run `hq cleanup` to report done/idle candidates, merged worktrees/branches, and
-dirty repositories. Report findings and exact commands, then ask the user before
+dirty repositories; use `-v` for the full item/command list before acting.
+Report findings and exact commands, then ask the user before
 stopping/removing sessions, worktrees, or branches. Only the explicitly authorized
 `hq janitor --apply` policy is exempt; `hq janitor` alone is a dry-run.
 Check `hq capacity` before spawning; use spawn `--force` only when requested.

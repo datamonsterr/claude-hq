@@ -17,10 +17,10 @@ When installed as a plugin without hq on PATH, use
 | Recover context | `/recap` in child; only if needed, `claude -p --resume <id> "<question>"` (adds a turn) |
 | Read logs | `claude logs <id>` |
 | Stop a session | After user approval, `hq stop <id-or-session-prefix>` (SIGINT twice; rm only for background ids) |
-| Find cleanup candidates | `hq cleanup [--idle-hours 12]` (report only) |
+| Find cleanup candidates | `hq cleanup [--idle-hours 12]`; `-v` lists all items/commands (report only) |
 | Check server | `hq health`; `-v` shows all, `--json` gives structured results |
 | Check admission | `hq capacity`; spawn refuses exhausted resources (exit 3); `--force` only when requested |
-| Automated cleanup | `hq janitor` plans; explicitly authorized `--apply` follows the policy in docs/SPEC.md |
+| Automated cleanup | `hq janitor` groups plans; `-v` lists all; explicitly authorized `--apply` logs full details |
 | Check memory bounds | `hq memory check` |
 | Clean disk | Use a disk-cleanup skill if one is installed |
 

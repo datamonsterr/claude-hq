@@ -7,3 +7,4 @@ use `"${CLAUDE_PLUGIN_ROOT}/bin/hq" cleanup` as a standalone fallback):
 $ARGUMENTS
 Report findings with exact commands; ask the user before stopping or removing
 anything. Preserve dirty work. Never execute cleanup automatically.
+The default report groups counts and three samples; use -v for the full item list.

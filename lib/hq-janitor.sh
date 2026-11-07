@@ -1,20 +1,5 @@
 #!/usr/bin/env bash
-# Only metadata is inspected: transcript contents are never opened.
-session_activity() {
-  local cwd=$1 sid=$2 fallback=$3 file encoded stamp found=false
-  ACTIVITY=$fallback
-  [[ $sid =~ ^[[:alnum:]_-]+$ ]] || return 0
-  encoded=${cwd//[\/.]/-}
-  local project_dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
-  local -a candidates=("$project_dir/$encoded/$sid.jsonl" "$project_dir"/*/"$sid.jsonl")
-  for file in "${candidates[@]}"; do
-    [[ -f $file && ! -L $file ]] || continue
-    if stamp=$(external stat -c %Y -- "$file") && [[ $stamp =~ ^[0-9]+$ ]]; then
-      if ! $found || (( stamp > ACTIVITY )); then ACTIVITY=$stamp; fi
-      found=true
-    fi
-  done
-}
+# Transcript mtimes are joined once by load_activity_index; no content is read.
 
 janitor_log() {
   local result=$1 summary=$2 bytes=0
@@ -27,13 +12,13 @@ janitor_log() {
 janitor_action() {
   local summary=$1
   shift
-  if ! $JANITOR_APPLY; then printf 'plan: %s\n' "$summary"; return 0; fi
+  if ! $JANITOR_APPLY; then report_action "$summary" "plan: $summary"; return 0; fi
   janitor_log attempt "$summary"
-  if "$@"; then
-    printf 'applied: %s\n' "$summary"
+  if "$@" >>"$JANITOR_LOG" 2>&1; then
+    report_action "$summary" "applied: $summary"
     janitor_log applied "$summary"
   else
-    printf 'kept: %s (action failed)\n' "$summary"
+    report_item failed 'failed actions (kept)' "$summary" '' true
     janitor_log failed "$summary"
     return 1
   fi
@@ -91,25 +76,25 @@ session_work_safe() {
 }
 
 janitor_sessions() {
-  local id sid kind state status pid cwd started age display
-  while IFS=$'\t' read -r id sid kind state status pid cwd started; do
-    (( started > 0 )) || continue
-    session_activity "$cwd" "$sid" "$started"
-    age=$((NOW-ACTIVITY))
+  local id sid kind state status pid cwd activity age display
+  while IFS=$'\t' read -r id sid kind state status pid cwd activity; do
+    (( activity > 0 )) || continue
+    age=$((NOW-activity))
     if [[ $kind == background && $state == 'done' && $id != '-' ]] && (( age > DONE_SECONDS )); then
       if session_work_safe "$cwd"; then
         janitor_action "remove done session $id" janitor_remove_session "$id" "$pid" || true
-      else printf 'kept: session %s has dirty, unmerged, or protected work\n' "$id"; fi
+      else report_item protected 'keep dirty/unmerged/protected sessions' "$id"; fi
     elif [[ $kind == background && $state != 'done' && $status != busy && $status != running && $state != busy && $state != working ]] && (( age > IDLE_SECONDS && pid > 1 )); then
       display=$id; [[ $display != '-' ]] || display=$sid
       janitor_action "stop idle background $display (conversation kept)" janitor_signal "$pid" || true
     elif [[ $kind != background && $status == idle ]] && (( age > INTERACTIVE_SECONDS && pid > 1 )); then
       if [[ ${HQ_JANITOR_STOP_INTERACTIVE:-0} == 1 ]]; then
         janitor_action "stop idle interactive $sid (conversation kept)" janitor_signal "$pid" || true
-      else printf 'report: idle interactive %s (set HQ_JANITOR_STOP_INTERACTIVE=1 to stop)\n' "$sid"; fi
+      else report_item interactive "stop idle interactive >${HQ_INTERACTIVE_HOURS:-24}h" \
+        "report: idle interactive $sid" ' (report-only; HQ_JANITOR_STOP_INTERACTIVE=1)'; fi
     fi
   done < <(jq -r '.[]|[(.id // "-"),(.sessionId // "-"),(.kind // "unknown"),(.state // "-"),
-    (.status // "unknown"),(.pid // 0),(.cwd // ""),((.startedAt // 0)/1000|floor)]|@tsv' <<<"$ALL_AGENTS")
+    (.status // "unknown"),(.pid // 0),(.cwd // ""),.lastActivity]|@tsv' <<<"$ALL_AGENTS")
 }
 
 remove_worktree_checked() {
@@ -137,14 +122,17 @@ delete_branch_checked() {
 }
 
 janitor_worktrees() {
-  local repo path base commit branch row matched prefix checked wtbranch wtpath
+  local repo path base commit branch matched prefix checked wtbranch wtpath key
   local -a prefixes
-  local -A removed=() pruned=()
+  local -A removed=() pruned=() occupied=()
   read -r -a prefixes <<<"${HQ_BRANCH_PREFIXES-hq/ so/ claude/ worktree-}"
+  while IFS=$'\t' read -r repo wtpath wtbranch; do
+    [[ -z $wtbranch ]] || occupied["$repo/$wtbranch"]+="$wtpath"$'\n'
+  done < <(jq -r '.[]|. as $p|.worktrees[]|select(.branch!="")|[$p.path,.path,.branch]|@tsv' <<<"$REPO_DATA")
   while IFS=$'\t' read -r repo path base commit; do
     [[ -n $repo && -n $base ]] || continue
     protected_memory "$path" && continue
-    has_live_cwd "$path" && { printf 'kept: live worktree %s\n' "$path"; continue; }
+    has_live_cwd "$path" && { report_item live 'keep live worktrees' "$path"; continue; }
     if janitor_action "remove merged worktree $path" remove_worktree_checked "$repo" "$path" "$base" "$commit"; then
       removed[$path]=1
       if [[ ! ${pruned[$repo]+yes} ]]; then
@@ -160,9 +148,10 @@ janitor_worktrees() {
     for prefix in "${prefixes[@]}"; do [[ $branch != "$prefix"* ]] || matched=true; done
     $matched || continue
     checked=false
-    while IFS=$'\t' read -r wtpath wtbranch; do
-      if [[ $wtbranch == "$branch" && ! ${removed[$wtpath]+yes} ]]; then checked=true; break; fi
-    done < <(jq -r --arg repo "$repo" '.[]|select(.path==$repo)|.worktrees[]|[.path,.branch]|@tsv' <<<"$REPO_DATA")
+    key=$repo/$branch
+    while IFS= read -r wtpath; do
+      if [[ -n $wtpath && ! ${removed[$wtpath]+yes} ]]; then checked=true; break; fi
+    done <<<"${occupied[$key]:-}"
     $checked && continue
     janitor_action "delete merged branch $branch in $repo" delete_branch_checked "$repo" "$branch" "$base" || true
   done < <(jq -r '.[]|. as $p|.mergedBranches[]|
@@ -249,17 +238,24 @@ janitor_temp() {
 }
 
 janitor() {
-  local apply=false state_dir settings key
+  local apply=false verbose=false state_dir settings key
   local -a args=(janitor)
-  case ${1:-} in --apply) apply=true; shift ;; esac
-  (( $# == 0 )) || die 'usage: hq janitor [--apply]'
+  while (( $# )); do
+    case $1 in --apply) apply=true ;; -v|--verbose) verbose=true ;; *) die 'usage: hq janitor [--apply] [-v]' ;; esac
+    shift
+  done
   for key in flock nice ionice stat find; do need "$key"; done
   if [[ ${HQ_JANITOR_CONTEXT:-0} != 1 ]]; then
     if $apply; then args+=(--apply); fi
+    if $verbose; then args+=(-v); fi
     exec timeout --kill-after=5 "${HQ_JANITOR_TIMEOUT:-120}" nice -n 19 ionice -c3 \
       env HQ_JANITOR_CONTEXT=1 "$HQ_DIR/bin/hq" "${args[@]}"
   fi
   JANITOR_APPLY=$apply
+  # Consumed by the shared report renderer.
+  # shellcheck disable=SC2034
+  REPORT_VERBOSE=$verbose
+  report_init
   state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/claude-hq
   [[ ! -L $state_dir && ! -L $state_dir/janitor.lock ]] || die 'refusing symlinked janitor state'
   external mkdir -p -- "$state_dir"
@@ -275,12 +271,16 @@ janitor() {
   read -r DONE_SECONDS IDLE_SECONDS INTERACTIVE_SECONDS key TMP_SECONDS SYSTEM_TMP_SECONDS <<<"$settings"
   WORKTREE_CUTOFF=$((NOW-key))
   load_agents all
+  load_activity_index
   discover; scan_repos
   mapfile -t LIVE_CWDS < <(jq -r '.[]|select(.state!="done" and .state!="completed" and .state!="stopped")|.cwd // empty' <<<"$ALL_AGENTS")
   mapfile -t LIVE_IDS < <(jq -r '.[]|select(.state!="done" and .state!="completed" and .state!="stopped")|(.sessionId // empty),(.id // empty)' <<<"$ALL_AGENTS")
   WORKTREE_ROWS=$(jq -r '.[]|. as $p|.worktrees[]|[.path,.dirty,.merged,(.path==$p.path)]|@tsv' <<<"$REPO_DATA")
-  printf 'Janitor %s\n' "$(if $apply; then printf apply; else printf dry-run; fi)"
+  printf 'Janitor %s' "$(if $apply; then printf apply; else printf dry-run; fi)"
+  if ! $verbose; then printf ' · up to 3 samples/rule; -v for all'; fi
+  printf '\n'
   janitor_sessions
   janitor_worktrees
   janitor_temp
+  report_render
 }

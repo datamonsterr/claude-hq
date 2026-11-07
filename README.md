@@ -93,10 +93,10 @@ Cleanup is a report followed by a user decision.
 | `hq spawn <project> [-n title] [-w [name]] [--mode mode] [--force] [--] [prompt…]` | Admission checks, then a built-in background Remote Control session |
 | `hq sessions [project] [-a] [--json]` | Grouped id, state (status fallback), age, name; `-a` adds completed and older idle sessions |
 | `hq stop <background-id\|sessionId-prefix>` | SIGINT twice; `claude rm` only for background ids |
-| `hq cleanup [--idle-hours 12] [--json]` | Report old done/idle sessions, merged worktrees/branches, dirty repositories |
+| `hq cleanup [--idle-hours 12] [-v] [--json]` | Grouped findings with up to three samples; -v or JSON includes all |
 | `hq health [-v] [--json]` | Warnings, or all local and Beszel checks with `-v` |
-| `hq capacity` | One line of session count, available memory, load/core, disk and tmpfs use |
-| `hq janitor [--apply]` | Plan cleanup; explicit --apply executes the bounded policy |
+| `hq capacity` | Session count, Claude RSS, older idle count, available memory, load/core, disk and tmpfs use |
+| `hq janitor [--apply] [-v]` | Grouped plans/results with up to three samples; -v lists all; apply logs full details |
 | `hq brief [-a]` | At most 30 lines of health, live sessions, dirty/ahead projects, cleanup count, memory Next |
 | `hq memory check` | Warn about an index over 80 lines or project notes over 40 |
 
@@ -136,6 +136,10 @@ Spawn requires fewer than `HQ_MAX_SESSIONS=40` live Claude processes, at least
 disk use <90%, and tmpfs `/tmp`/`$TMPDIR` use <80%. Refusal exits 3 with a one-line
 reason; `--force` explicitly bypasses admission. `hq capacity` is also the first
 line of `hq brief`.
+For example: `sessions 56/40 (13.1G rss, 54 idle>24h)`. All live processes count,
+including older idle sessions. RSS sums accessible live-pid VmRSS metadata;
+exited processes are skipped. A session-count refusal includes the older idle
+count and points to `hq janitor`.
 
 Start with `hq janitor` to review planned actions. `hq janitor --apply` enables
 the policy in [SPEC: Capacity and auto-clean](docs/SPEC.md#capacity-and-auto-clean):
@@ -149,8 +153,9 @@ the policy in [SPEC: Capacity and auto-clean](docs/SPEC.md#capacity-and-auto-cle
   >3 days: remove only without live ids, newer descendants, or Git work. At >70%
   `/tmp` tmpfs use, remove user-owned non-Git files older than 2 days there.
 
-Age uses transcript file mtimes without reading contents, falling back to
-session start time if no file exists. Idle conversations are retained; idle alone
+Age uses one depth-two transcript mtime index and a sessionId join, without
+reading contents or running per-session globs/stat processes. Duplicate ids use
+the newest mtime, with session start time as fallback. Idle conversations are retained; idle alone
 does not establish completed work. Dirty/unmerged work, symlink targets, live
 worktrees, and HQ memory are protected. Configure the `HQ_*` thresholds listed
 in [config.example.env](config.example.env). Each external janitor call has a
@@ -234,7 +239,9 @@ claude plugin validate .
 Tests use a temporary HOME, Git repositories, and stubbed `claude`, `curl`,
 `systemctl`, `df`, and signals. They never start a real session, contact the
 network, or touch real Claude configuration. Plugin validation checks metadata
-and packaging without starting a session.
+and packaging without starting a session. Performance coverage includes 150
+project directories x 20 transcripts, 20 repositories, and 132 branches;
+see [performance measurements](docs/performance.md).
 
 ## Credits and research
 
