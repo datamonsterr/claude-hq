@@ -19,7 +19,9 @@ Do not introduce a session registry, tmux manager, transcript parser, or own pur
 
 Run `hq cleanup` to report done/idle candidates, merged worktrees/branches, and
 dirty repositories. Report findings and exact commands, then ask the user before
-stopping/removing sessions, worktrees, or branches. Never delete automatically.
+stopping/removing sessions, worktrees, or branches. Only the explicitly authorized
+`hq janitor --apply` policy is exempt; `hq janitor` alone is a dry-run.
+Check `hq capacity` before spawning; use spawn `--force` only when requested.
 `hq health` shows warnings; `-v` includes healthy Beszel and local checks.
 Use a disk-cleanup skill if one is installed when disk cleanup is requested.
 

@@ -23,7 +23,8 @@ Verified on Claude Code 2.1.319 (2026-11-07):
 | Health + alerts | Beszel hub (already alerts, heartbeat) | `hq health`: compact Beszel summary via its PocketBase API; tiny local fallback (df, failed units) |
 | Memory | Built-in auto memory (MEMORY.md index + topic files, loaded at start, survives `/clear`) | layout + rules, stored in repo so it syncs via git (see Memory) |
 
-Dropped from v0.1: tmux, own session registry, own transcript parsing, own stop/kill, auto-delete.
+Dropped from v0.1: tmux, own session registry, transcript parsing, own purge service.
+Automatic deletion is limited to the explicit janitor policy below.
 
 ## Shape
 
@@ -33,28 +34,101 @@ claude-hq/
   CLAUDE.md                 HQ controller rules (<60 lines)
   .claude/settings.json     HQ-dir settings (memory dir if allowed, permissions for hq/claude agents)
   bin/hq                    bash; deps: bash, git, jq, curl, claude
+  lib/hq-{capacity,repos,janitor}.sh   resource checks, bounded scans, janitor glue
   skills/hq/SKILL.md        decision table: which built-in or hq command per intent
   commands/brief.md, spawn.md, cleanup.md
   .hq-root                  marker for the HQ-only SessionStart briefing
   hooks/hooks.json          SessionStart: `hq brief` only if CLAUDE_PROJECT_DIR has .hq-root
   memory/                   durable memory (see Memory)
   systemd/claude-hq.service user unit keeping `claude remote-control --name HQ` alive in the repo dir
+  systemd/claude-hq-janitor.service, .timer   optional cleanup every 15 minutes
   install.sh, config.example.env, tests/run.sh, README.md
 ```
 
 ## `hq` CLI (each output compact; `--json` where useful)
 
 - `hq projects` — git repos directly under `HQ_ROOTS` (colon list, default `~/dev`), skipping `*-worktrees`. Row: name, branch, dirty count, ahead/behind, last commit age, live session count (from `claude agents --json` cwd prefix).
-- `hq spawn <project> [-n title] [-w [name]] [--mode <permission-mode>] [prompt…]` — runs the built-in command above in the project dir. Prints short id + title. Title default `"<project>: <first 6 words of prompt>"`.
+- `hq spawn <project> [-n title] [-w [name]] [--mode <permission-mode>] [--force] [prompt…]` — checks capacity, then runs the built-in command above in the project dir. Prints short id + title. Title default `"<project>: <first 6 words of prompt>"`.
 - `hq sessions [project]` — `claude agents --json` (add `--all` with `-a`) grouped by project root, columns id, state/status, age, name.
 - `hq stop <id>` — SIGINT the session pid twice, then `claude rm <id>` for background ids only. Interactive rows resolve by unambiguous sessionId prefix; display `.id // (.sessionId[0:8])` and `.state // .status` in sessions.
 - `hq cleanup [--idle-hours 12]` — report only, with exact commands to run (`claude stop/rm`, `git worktree remove`, `git branch -d`). Never deletes.
 - `hq health` — if `BESZEL_URL`, `BESZEL_EMAIL`, `BESZEL_PASSWORD` set: auth (`/api/collections/users/auth-with-password`), list systems (name, status, cpu/mem/disk %) and active alerts. Else/also: root+home disk %, `systemctl --failed` count. Warnings only by default, `-v` for all.
-- `hq brief [-a]` — <=30 lines: health warnings, live sessions per project, dirty/ahead projects, cleanup count, top of memory "Next".
+- `hq brief [-a]` — <=30 lines: capacity at top, health warnings, live sessions per project, dirty/ahead projects, cleanup count, top of memory "Next".
 
 Sessions and brief hide idle interactive rows aged >=24h by default, reporting
 "N older idle hidden, -a to show"; -a includes them. JSON sessions report the count
 on stderr. Projects LIVE counts only non-terminal rows that are non-idle or <24h.
+
+## Capacity and auto-clean
+
+This section authorizes janitor's bounded cleanup only. `hq cleanup` remains
+report-only. No session registry, transcript content parsing, or replacement for
+Claude's session/worktree operations is introduced.
+
+`hq capacity` prints one line, for example:
+`sessions 23/40 · mem 14G avail · load 0.4/core · disk 43% · tmp 16%`.
+Sessions counts non-done/non-stopped rows with a pid, including interactive rows.
+Disk and tmp show the maximum relevant percentage across the checked paths.
+Spawn refuses with exit 3 and one-line reason unless all of these hold:
+
+- sessions < `HQ_MAX_SESSIONS` (40);
+- MemAvailable from `/proc/meminfo` >= `HQ_MIN_MEM_MB` (3072);
+- load1 from `/proc/loadavg` / `nproc` <= `HQ_MAX_LOAD` (1.5);
+- disk use of `/` and `$HOME` <90%;
+- tmpfs use at `/tmp` and `$TMPDIR` <80% (default scratch directory `~/.cache/tmp`).
+
+Unavailable metrics refuse admission. `hq spawn --force` explicitly bypasses
+checks. `HQ_MEMINFO_FILE` and `HQ_LOADAVG_FILE` allow fixture files in tests.
+
+`hq janitor [--apply]` defaults to dry-run, printing planned actions. Both modes
+hold a nonblocking flock in `${XDG_STATE_HOME:-~/.local/state}/claude-hq/`.
+Janitor self-applies `nice -n 19` and `ionice -c3`. External calls have timeouts
+(`HQ_CALL_TIMEOUT=8` seconds; whole run `HQ_JANITOR_TIMEOUT=120`); Git calls and
+each repository scan are bounded to 5 seconds. Repository scans use four workers
+and `git --no-optional-locks`. A single cached `claude agents --json --all` query
+serves each invocation. Incomplete scans never authorize session/worktree removal.
+
+Last activity is the transcript **mtime only**, never its contents: stat
+`$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<sessionId>.jsonl` (default config dir
+`~/.claude`), encoding `/` and `.` as `-`, then glob across project directories
+by sessionId if necessary. Missing files fall back to `startedAt`; missing both
+keeps the session. There is no persistent session-state tracking.
+
+Janitor policy:
+
+1. Background **done** sessions inactive > `HQ_DONE_HOURS` (2) are interrupted
+   twice, then removed with `claude rm`. Dirty/unmerged work or an incomplete
+   repository snapshot prevents removal. Background state idle uses rule 2,
+   preserving its resumable conversation; idle is not proof of completion.
+2. Other background sessions that are not busy/running/working and inactive >
+   `HQ_IDLE_HOURS` (12) receive SIGINT twice only; no rm.
+3. Interactive/remote idle sessions inactive > `HQ_INTERACTIVE_HOURS` (24) are
+   reported only, unless `HQ_JANITOR_STOP_INTERACTIVE=1`; that opt-in stops only.
+4. Registered worktrees are discovered through Git for every repository under
+   HQ_ROOTS, including sibling `<repo>-worktrees/*` and `.claude/worktrees/*`.
+   Remove only non-primary worktrees with no modified, untracked, or ignored
+   files; tip fully merged into the default branch (equivalently zero commits
+   beyond its merge-base; origin/HEAD, then local main/master, otherwise keep);
+   no live cwd inside; no filesystem activity for
+   `HQ_WORKTREE_HOURS` (1). Recheck before applying. Prune after removal. Delete
+   merged, unoccupied local branches only when a prefix in `HQ_BRANCH_PREFIXES`
+   matches (default `hq/ so/ claude/ worktree-`). Never delete the default branch.
+5. Under `$TMPDIR` (default `~/.cache/tmp`), remove user-owned Claude scratchpad/
+   session directories older than `HQ_TMP_DAYS` (3), without newer descendants,
+   Git work, or live session ids in their path/tree. Do not follow symlinks or
+   cross filesystem boundaries. If `/tmp` is tmpfs and >
+   `HQ_TMP_PRESSURE_PCT` (70) percent full, remove user-owned files there older
+   than `HQ_SYSTEM_TMP_DAYS` (2), protecting Git work and live session paths.
+   Never leave the selected scratch root or `/tmp`.
+6. Never touch dirty/unmerged work or this HQ checkout's `memory/`. Metadata,
+   names, ownership and mtimes may be inspected; transcript contents are not read.
+
+Every applied action is logged to the state directory's `janitor.log`; at 1 MiB
+rotate to `janitor.log.1`, retaining one previous log. Failed attempts are logged
+as failures. Dry-run does not write action logs. The optional user service/timer
+runs every 15 minutes with Nice=19, IOSchedulingClass=idle, CPUWeight=10,
+MemoryMax=256M. Installer prints enable commands but does not enable it. Suggest
+`cleanupPeriodDays: 14` in user settings; never edit those settings automatically.
 
 ## Memory
 
@@ -83,10 +157,10 @@ Rules (in CLAUDE.md):
 ## Acceptance
 
 - `bash -n bin/hq`; shellcheck clean if installed.
-- `tests/run.sh`: fixture HOME + stub `claude` (records argv, returns canned `agents --json`), stub `curl`/`systemctl`/`df`; no network, no real `~/.claude`. Covers projects, spawn argv, sessions grouping, cleanup report, health with and without Beszel, brief <=30 lines.
+- `tests/run.sh`: fixture HOME + stub `claude`, `curl`, `systemctl`, `df`, resource and filesystem probes; no network, real sessions, or real `~/.claude`. Covers admission, every janitor policy and negative cases, and 40 sessions + 20 repos: brief and janitor dry-run each <3s, one agent query, brief <=30 lines.
 - `claude plugin validate .` passes.
 - No secrets, hostnames, IPs, personal paths committed.
 
 ## Out of scope
 
-Web UI, MCP server, multi-machine, auto-deletion, auto-merging, cost tracking.
+Web UI, MCP server, multi-machine, deletion outside janitor policy, auto-merging, cost tracking.

@@ -9,12 +9,14 @@ No SSH access from the laptop is needed.
 HQ is Bash glue around Claude Code built-ins. Claude owns background sessions,
 session discovery, Remote Control, worktrees, logs, and auto memory. HQ adds
 project resolution, compact reports, and controller instructions. There is no
-session registry, tmux manager, transcript parser, daemon, or auto-deletion.
+session registry, tmux manager, transcript parser, or daemon. An optional bounded
+janitor performs only the automatic cleanup described below.
 [docs/SPEC.md](docs/SPEC.md) defines the scope.
 
 ## Five-minute home-server setup
 
-Requires Bash 4+, Git, jq, curl, and Claude Code with background sessions and
+Requires Linux, Bash 4+, Git, jq, curl, GNU coreutils/findutils (including timeout,
+stat, nproc, and xargs), util-linux (flock/ionice), and Claude Code with background sessions and
 Remote Control (verified interface: 2.1.319). Sign in to a Claude account with
 Remote Control available. Start with this checkout at `~/dev/claude-hq`.
 
@@ -88,11 +90,13 @@ Cleanup is a report followed by a user decision.
 | Command | Result |
 |---|---|
 | `hq projects [--json]` | Name, branch, dirty count, ahead/behind, last commit age, live sessions |
-| `hq spawn <project> [-n title] [-w [name]] [--mode mode] [--] [prompt…]` | Built-in background Remote Control session in the project directory |
+| `hq spawn <project> [-n title] [-w [name]] [--mode mode] [--force] [--] [prompt…]` | Admission checks, then a built-in background Remote Control session |
 | `hq sessions [project] [-a] [--json]` | Grouped id, state (status fallback), age, name; `-a` adds completed and older idle sessions |
 | `hq stop <background-id\|sessionId-prefix>` | SIGINT twice; `claude rm` only for background ids |
 | `hq cleanup [--idle-hours 12] [--json]` | Report old done/idle sessions, merged worktrees/branches, dirty repositories |
 | `hq health [-v] [--json]` | Warnings, or all local and Beszel checks with `-v` |
+| `hq capacity` | One line of session count, available memory, load/core, disk and tmpfs use |
+| `hq janitor [--apply]` | Plan cleanup; explicit --apply executes the bounded policy |
 | `hq brief [-a]` | At most 30 lines of health, live sessions, dirty/ahead projects, cleanup count, memory Next |
 | `hq memory check` | Warn about an index over 80 lines or project notes over 40 |
 
@@ -121,9 +125,54 @@ when disk cleanup is requested.
 
 Cleanup uses **session age**, not measured idle duration: `claude agents --json`
 has a start timestamp but no idle timestamp. A merged branch means its tip is
-an ancestor of `origin/HEAD`, otherwise local `main`, `master`, or the current
-branch. Review that base in each finding. Dirty worktrees are flagged without
+an ancestor of `origin/HEAD`, otherwise local `main` or `master`. If no default
+can be established, work is kept. Review the base in each finding. Dirty worktrees are flagged without
 a removal command. No command is executed by cleanup.
+
+## Capacity and automatic cleanup
+
+Spawn requires fewer than `HQ_MAX_SESSIONS=40` live Claude processes, at least
+`HQ_MIN_MEM_MB=3072` available memory, load1/core <=`HQ_MAX_LOAD=1.5`, root/home
+disk use <90%, and tmpfs `/tmp`/`$TMPDIR` use <80%. Refusal exits 3 with a one-line
+reason; `--force` explicitly bypasses admission. `hq capacity` is also the first
+line of `hq brief`.
+
+Start with `hq janitor` to review planned actions. `hq janitor --apply` enables
+the policy in [SPEC: Capacity and auto-clean](docs/SPEC.md#capacity-and-auto-clean):
+
+- Done backgrounds inactive >2h: SIGINT twice, then built-in rm if work is safe.
+- Other non-busy backgrounds inactive >12h: stop only; keep the conversation.
+- Interactive/remote idle >24h: report only unless `HQ_JANITOR_STOP_INTERACTIVE=1`.
+- Clean, merged, non-live worktrees untouched >1h: remove with Git, then prune;
+  delete merged branches only with an approved prefix (`hq/ so/ claude/ worktree-`).
+- Stale Claude scratch/session directories in `$TMPDIR` (default `~/.cache/tmp`)
+  >3 days: remove only without live ids, newer descendants, or Git work. At >70%
+  `/tmp` tmpfs use, remove user-owned non-Git files older than 2 days there.
+
+Age uses transcript file mtimes without reading contents, falling back to
+session start time if no file exists. Idle conversations are retained; idle alone
+does not establish completed work. Dirty/unmerged work, symlink targets, live
+worktrees, and HQ memory are protected. Configure the `HQ_*` thresholds listed
+in [config.example.env](config.example.env). Each external janitor call has a
+timeout, scans use four workers with a five-second repository budget, and each
+invocation queries Claude's agents only once. Janitor runs at low CPU/I/O priority,
+holds an exclusive flock, and logs applied actions to
+`${XDG_STATE_HOME:-~/.local/state}/claude-hq/janitor.log` (1 MiB rotation, one backup).
+
+To opt into the user timer after reviewing a dry-run:
+
+```bash
+cp systemd/claude-hq-janitor.{service,timer} ~/.config/systemd/user/
+# Adjust WorkingDirectory and ExecStart in the copied service for your checkout.
+systemctl --user daemon-reload
+systemctl --user enable --now claude-hq-janitor.timer
+```
+
+The timer runs every 15 minutes; the service sets Nice=19,
+IOSchedulingClass=idle, CPUWeight=10 and MemoryMax=256M. `install.sh` prints these
+enable commands and does not enable the timer. Also consider setting
+`"cleanupPeriodDays": 14` in `~/.claude/settings.json` yourself; the installer
+only prints this suggestion and never edits user Claude settings.
 
 Health always checks root/home disk usage and failed system units when available.
 Default warnings: disk/memory >=85%, CPU >=90%, a non-up Beszel system, or a
@@ -201,4 +250,4 @@ disclosure; [basic-memory](https://github.com/basicmachines-co/basic-memory),
 [agentmemory](https://github.com/rohitg00/agentmemory), and cavemem/caveman were
 evaluated without adding their servers. [Beads](https://github.com/gastownhall/beads)
 remains an optional future task layer. No web UI, MCP server, multi-machine
-coordination, auto-merge, auto-deletion, or cost tracking is included.
+coordination, auto-merge, deletion outside janitor policy, or cost tracking is included.

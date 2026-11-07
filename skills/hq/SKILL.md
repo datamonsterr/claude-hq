@@ -16,9 +16,11 @@ When installed as a plugin without hq on PATH, use
 | Ask child for status | Use `ListAgents` and `SendMessage` after checking sessions |
 | Recover context | `/recap` in child; only if needed, `claude -p --resume <id> "<question>"` (adds a turn) |
 | Read logs | `claude logs <id>` |
-| Stop a session | After user approval, `hq stop <background-id|sessionId-prefix>` (SIGINT twice; rm only for background ids) |
+| Stop a session | After user approval, `hq stop <id-or-session-prefix>` (SIGINT twice; rm only for background ids) |
 | Find cleanup candidates | `hq cleanup [--idle-hours 12]` (report only) |
 | Check server | `hq health`; `-v` shows all, `--json` gives structured results |
+| Check admission | `hq capacity`; spawn refuses exhausted resources (exit 3); `--force` only when requested |
+| Automated cleanup | `hq janitor` plans; explicitly authorized `--apply` follows the policy in docs/SPEC.md |
 | Check memory bounds | `hq memory check` |
 | Clean disk | Use a disk-cleanup skill if one is installed |
 
@@ -29,8 +31,9 @@ Ask children to finish with a summary of at most 2,000 tokens.
 Surface workspace-trust messages so the user can trust the directory locally.
 Treat built-in agent names as summaries; do not parse transcript files.
 Cleanup means report exact commands, then ask the user before acting.
-Idle cleanup uses session age because the agent list exposes no idle timestamp.
-Do not create a session registry, tmux manager, purge service, or auto-deletion.
+The cleanup report uses session age; janitor checks transcript mtimes, never contents.
+Do not create a session registry, tmux manager, or purge service.
+Only explicitly authorized janitor --apply may perform automatic cleanup.
 
 Use built-in auto memory in the HQ checkout's `memory/`, wired by `install.sh`.
 When installed elsewhere, run the original checkout's installer to set HQ memory;

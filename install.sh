@@ -20,3 +20,10 @@ if [[ ! -e $config_dir/config.env ]]; then
 fi
 printf 'Installed ~/.local/bin/hq; memory configured in repo settings.\n'
 printf 'Configure ~/.config/claude-hq/config.env and add ~/.local/bin to PATH.\n'
+printf '\nOptional janitor timer (not enabled by this installer):\n'
+printf 'mkdir -p ~/.config/systemd/user\n'
+printf 'cp %q/systemd/claude-hq-janitor.{service,timer} ~/.config/systemd/user/\n' "$repo"
+printf '# Adjust WorkingDirectory and ExecStart in the copied service if needed.\n'
+printf 'systemctl --user daemon-reload\n'
+printf 'systemctl --user enable --now claude-hq-janitor.timer\n'
+printf '\nSuggested user setting: "cleanupPeriodDays": 14 in ~/.claude/settings.json (edit it yourself).\n'

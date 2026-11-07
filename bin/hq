@@ -2,19 +2,32 @@
 # Thin glue over Claude Code's session, worktree, and memory facilities.
 set -euo pipefail
 
+HQ_ACTION=${1:-help}
+external() {
+  if [[ $HQ_ACTION == janitor || ${HQ_JANITOR_CONTEXT:-0} == 1 ]]; then
+    command timeout --kill-after=1 "${HQ_CALL_TIMEOUT:-8}" "$@"
+  else
+    command "$@"
+  fi
+}
+git() { command timeout --kill-after=1 5 git --no-optional-locks "$@"; }
+jq() { external jq "$@"; }
+claude() { external claude "$@"; }
+
 die() { printf 'hq: %s\n' "$*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
+need() { type -P "$1" >/dev/null || die "missing dependency: $1"; }
 need jq
 need git
+need timeout
 
 # Resolve the installed symlink so memory always belongs to this checkout.
 source_path=${BASH_SOURCE[0]}
 while [[ -L $source_path ]]; do
-  source_dir=$(cd -P -- "$(dirname -- "$source_path")" && pwd)
-  source_path=$(readlink -- "$source_path")
+  source_dir=$(cd -P -- "$(external dirname -- "$source_path")" && pwd)
+  source_path=$(external readlink -- "$source_path")
   [[ $source_path = /* ]] || source_path=$source_dir/$source_path
 done
-HQ_DIR=$(cd -P -- "$(dirname -- "$source_path")/.." && pwd)
+HQ_DIR=$(cd -P -- "$(external dirname -- "$source_path")/.." && pwd)
 config=${XDG_CONFIG_HOME:-$HOME/.config}/claude-hq/config.env
 if [[ -f $config ]]; then
   # User-owned shell configuration; never search project .env files.
@@ -23,19 +36,23 @@ if [[ -f $config ]]; then
 fi
 HQ_ROOTS=${HQ_ROOTS:-$HOME/dev}
 MEMORY_DIR=$HQ_DIR/memory
-NOW=$(date +%s)
+NOW=$(external date +%s)
 AGENTS='[]'
+ALL_AGENTS=''
 PROJECTS='[]'
+REPO_DATA=''
 REPOS=()
 
 usage() {
   cat <<'EOF'
 Usage: hq projects [--json]
-       hq spawn <project> [-n title] [-w [name]] [--mode mode] [--] [prompt…]
+       hq spawn <project> [-n title] [-w [name]] [--mode mode] [--force] [--] [prompt…]
        hq sessions [project] [-a|--all] [--json]
        hq stop <id>
        hq cleanup [--idle-hours N] [--json]
        hq health [-v] [--json]
+       hq capacity
+       hq janitor [--apply]
        hq brief [-a|--all]
        hq memory check
 Projects are repositories directly under HQ_ROOTS (colon-separated; default ~/dev).
@@ -45,16 +62,20 @@ EOF
 
 load_agents() {
   need claude
-  local args=(agents --json)
-  [[ ${1:-} != all ]] || args+=(--all)
-  AGENTS=$(claude "${args[@]}") || die 'claude agents failed'
-  jq -e 'type == "array" and all(.[]; type == "object")' <<<"$AGENTS" >/dev/null \
-    || die 'claude agents returned invalid JSON'
+  if [[ -z $ALL_AGENTS ]]; then
+    ALL_AGENTS=$(claude agents --json --all) || die 'claude agents failed'
+    jq -e 'type == "array" and all(.[]; type == "object")' <<<"$ALL_AGENTS" >/dev/null \
+      || die 'claude agents returned invalid JSON'
+  fi
+  AGENTS=$ALL_AGENTS
+  if [[ ${1:-} != all ]]; then
+    AGENTS=$(jq '[.[]|select(.state != "done" and .state != "completed" and .state != "stopped")]' <<<"$ALL_AGENTS")
+  fi
 }
 
 discover() {
-  local root dir top
-  local -a roots
+  local root dir top common
+  local -a roots candidates
   local -A seen=()
   IFS=: read -r -a roots <<<"$HQ_ROOTS"
   shopt -s nullglob dotglob
@@ -62,10 +83,18 @@ discover() {
   for root in "${roots[@]}"; do
     [[ $root != \~/* ]] || root=$HOME/${root:2}
     [[ -d $root ]] || continue
-    for dir in "$root"/*; do
+    candidates=("$root"/*)
+    if [[ $HQ_ACTION == janitor ]]; then candidates+=("$root"/*-worktrees/*); fi
+    for dir in "${candidates[@]}"; do
       [[ -d $dir && ${dir##*/} != *-worktrees ]] || continue
       dir=$(cd -- "$dir" && pwd -P)
       [[ -e $dir/.git ]] || continue
+      if [[ -f $dir/.git ]]; then
+        common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+        [[ $common == */.git ]] || continue
+        dir=${common%/.git}
+        [[ -d $dir ]] || continue
+      fi
       top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue
       [[ $top = "$dir" && ! ${seen[$dir]+yes} ]] || continue
       seen[$dir]=1
@@ -75,10 +104,7 @@ discover() {
 }
 
 project_paths() {
-  local dir
-  for dir in "${REPOS[@]}"; do
-    jq -cn --arg name "${dir##*/}" --arg path "$dir" '{name:$name,path:$path}'
-  done | jq -s 'sort_by(.name,.path)'
+  printf '%s\0' "${REPOS[@]}" | jq -Rs '[split("\u0000")[]|select(length>0)|{name:(split("/")|last),path:.}]|sort_by(.name,.path)'
 }
 
 resolve_project() {
@@ -92,29 +118,12 @@ resolve_project() {
 }
 
 collect_projects() {
-  local dir branch dirty ahead behind counts stamp age
-  PROJECTS=$(
-    for dir in "${REPOS[@]}"; do
-      branch=$(git -C "$dir" symbolic-ref --short -q HEAD || git -C "$dir" rev-parse --short HEAD 2>/dev/null || printf '(unborn)')
-      dirty=$(git -C "$dir" status --porcelain=v1 | wc -l)
-      ahead=0; behind=0
-      if counts=$(git -C "$dir" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null); then
-        read -r ahead behind <<<"$counts"
-      fi
-      age=null
-      if stamp=$(git -C "$dir" log -1 --format=%ct 2>/dev/null) && [[ -n $stamp ]]; then
-        age=$(( NOW > stamp ? NOW - stamp : 0 ))
-      fi
-      jq -cn --arg name "${dir##*/}" --arg path "$dir" --arg branch "$branch" \
-        --argjson dirty "$dirty" --argjson ahead "$ahead" --argjson behind "$behind" \
-        --argjson age "$age" --argjson agents "$AGENTS" --argjson now "$NOW" '
-        {name:$name,path:$path,branch:$branch,dirty:$dirty,ahead:$ahead,behind:$behind,
-         lastCommitAgeSeconds:$age,liveSessions:([$agents[] |
-           select(.state != "done" and .state != "completed" and .state != "stopped") |
-           select(.status != "idle" or ($now - ((.startedAt // ($now*1000))/1000)) < 86400) |
-           select(.cwd == $path or ((.cwd // "") | startswith($path+"/")))] | length)}'
-    done | jq -s 'sort_by(.name,.path)'
-  )
+  scan_repos
+  PROJECTS=$(jq --argjson agents "$AGENTS" --argjson now "$NOW" 'map(. as $p |
+    del(.worktrees,.mergedBranches,.base) + {liveSessions:([$agents[] |
+      select(.state != "done" and .state != "completed" and .state != "stopped") |
+      select(.status != "idle" or ($now - ((.startedAt // ($now*1000))/1000)) < 86400) |
+      select(.cwd == $p.path or ((.cwd // "")|startswith($p.path+"/")))]|length)})' <<<"$REPO_DATA")
 }
 
 projects() {
@@ -129,8 +138,8 @@ projects() {
 }
 
 spawn() {
-  (( $# > 0 )) || die 'usage: hq spawn <project> [-n title] [-w [name]] [--mode mode] [prompt…]'
-  local project=$1 title='' worktree=false worktree_name='' mode='' prompt dir output rc=0 id
+  (( $# > 0 )) || die 'usage: hq spawn <project> [-n title] [-w [name]] [--mode mode] [--force] [prompt…]'
+  local project=$1 title='' worktree=false worktree_name='' mode='' prompt dir output rc=0 id force=false reason
   shift
   while (( $# )); do
     case $1 in
@@ -139,6 +148,7 @@ spawn() {
         worktree=true; shift
         if (( $# )) && [[ $1 != -* ]]; then worktree_name=$1; shift; fi ;;
       --mode) (( $# >= 2 )) || die 'missing permission mode'; mode=$2; shift 2 ;;
+      --force) force=true; shift ;;
       --) shift; break ;;
       -*) die "unknown spawn option: $1" ;;
       *) break ;;
@@ -146,6 +156,12 @@ spawn() {
   done
   prompt=$*
   discover; dir=$(resolve_project "$project")
+  if ! $force; then
+    load_agents
+    collect_capacity
+    reason=$(jq -r '.reasons[0] // empty' <<<"$CAPACITY_JSON")
+    if [[ -n $reason ]]; then printf 'hq: spawn refused: %s\n' "$reason" >&2; return 3; fi
+  fi
   if [[ -z $title ]]; then
     title=$(jq -rn --arg prompt "$prompt" '$prompt | [scan("\\S+")][0:6] | join(" ")')
     title="${dir##*/}: ${title:-work}"
@@ -241,69 +257,23 @@ stop_session() {
   fi
 }
 
-cleanup_item() {
-  local kind=$1 project=$2 summary=$3
-  shift 3
-  { if (( $# )); then printf '%s\0' "$@"; fi; } | jq -Rsc --arg kind "$kind" --arg project "$project" --arg summary "$summary" \
-    '{kind:$kind,project:$project,summary:$summary,commands:(split("\u0000")[:-1])}'
-}
-
 cleanup_data() {
-  local hours=$1 dir base branch current field wt='' wtcommit='' dirty command_remove command_branch id state age background
-  {
-    while IFS=$'\t' read -r id state age background; do
-      [[ -n $id ]] || continue
-      if [[ $background == true ]]; then
-        printf -v command_remove 'claude rm %q' "$id"
-        printf -v command_branch 'claude stop %q' "$id"
-        cleanup_item session '' "$id $state; session age ${age}h (idle duration unavailable)" "$command_branch" "$command_remove"
-      else
-        printf -v command_branch 'hq stop %q' "$id"
-        cleanup_item session '' "$id $state; session age ${age}h (idle duration unavailable)" "$command_branch"
-      fi
-    done < <(jq -r --argjson now "$NOW" --argjson hours "$hours" '.[] |
-      select(.state == "done" or .state == "completed" or .status == "idle") |
-      select((.startedAt|type) == "number" and ($now - .startedAt/1000) > ($hours*3600)) |
-      [(.id // (.sessionId[0:8])),(.state // .status),((($now-.startedAt/1000)/3600)|floor),
-       (.kind == "background" and .id != null)]|@tsv' <<<"$AGENTS")
-    for dir in "${REPOS[@]}"; do
-      current=$(git -C "$dir" symbolic-ref --short -q HEAD || true)
-      base=$(git -C "$dir" symbolic-ref -q refs/remotes/origin/HEAD || true)
-      if [[ -z $base ]]; then
-        for branch in main master "$current"; do
-          if [[ -n $branch ]] && git -C "$dir" rev-parse --verify "$branch^{commit}" >/dev/null 2>&1; then base=$branch; break; fi
-        done
-      fi
-      wt=''; wtcommit=''
-      while IFS= read -r -d '' field; do
-        case $field in
-          'worktree '*) wt=${field#worktree } ;;
-          'HEAD '*) wtcommit=${field#HEAD } ;;
-          '')
-            if [[ -n $wt && -d $wt ]]; then
-              dirty=$(git -C "$wt" status --porcelain=v1 | wc -l)
-              if (( dirty > 0 )); then cleanup_item dirty "${dir##*/}" "$wt: $dirty dirty entries"; fi
-              if [[ $wt != "$dir" && -n $base && -n $wtcommit ]] && \
-                  git -C "$dir" merge-base --is-ancestor "$wtcommit" "$base" 2>/dev/null; then
-                printf -v command_remove 'git -C %q worktree remove -- %q' "$dir" "$wt"
-                if (( dirty == 0 )); then
-                  cleanup_item worktree "${dir##*/}" "$wt merged into $base" "$command_remove"
-                else
-                  cleanup_item worktree "${dir##*/}" "$wt merged into $base; preserve dirty work before removal"
-                fi
-              fi
-            fi
-            wt=''; wtcommit='' ;;
-        esac
-      done < <(git -C "$dir" worktree list --porcelain -z)
-      [[ -n $base ]] || continue
-      while IFS= read -r branch; do
-        [[ -n $branch && $branch != "$current" && $branch != "$base" && $branch != main && $branch != master ]] || continue
-        printf -v command_branch 'git -C %q branch -d -- %q' "$dir" "$branch"
-        cleanup_item branch "${dir##*/}" "$branch merged into $base (remove its worktree first if checked out)" "$command_branch"
-      done < <(git -C "$dir" for-each-ref --merged="$base" --format='%(refname:short)' refs/heads/)
-    done
-  } | jq -s '.'
+  local hours=$1
+  scan_repos
+  jq -n --argjson agents "$AGENTS" --argjson repos "$REPO_DATA" --argjson now "$NOW" --argjson hours "$hours" '
+    [$agents[] | select(.state == "done" or .state == "completed" or .status == "idle") |
+      select((.startedAt|type)=="number" and ($now-.startedAt/1000)>($hours*3600)) |
+      (.id // (.sessionId[0:8])) as $id |
+      {kind:"session",project:"",summary:("\($id) \(.state // .status); session age \((($now-.startedAt/1000)/3600)|floor)h (idle duration unavailable)"),
+       commands:(if .kind=="background" and .id!=null then ["claude stop \($id|@sh)","claude rm \($id|@sh)"] else ["hq stop \($id|@sh)"] end)}] +
+    [$repos[] | . as $p | .worktrees[] | select(.dirty>0) |
+      {kind:"dirty",project:$p.name,summary:"\(.path): \(.dirty) dirty entries",commands:[]}] +
+    [$repos[] | . as $p | .worktrees[] | select(.path!=$p.path and .merged) |
+      {kind:"worktree",project:$p.name,summary:"\(.path) merged into \($p.base)" + (if .dirty>0 then "; preserve dirty work before removal" else "" end),
+       commands:(if .dirty>0 then [] else ["git -C \($p.path|@sh) worktree remove -- \(.path|@sh)"] end)}] +
+    [$repos[] | . as $p | .mergedBranches[] | select(.!=$p.branch and .!=($p.base|sub("^refs/remotes/[^/]+/";"")) and .!="main" and .!="master") |
+      {kind:"branch",project:$p.name,summary:"\(.) merged into \($p.base) (remove its worktree first if checked out)",
+       commands:["git -C \($p.path|@sh) branch -d -- \(.|@sh)"]}]'
 }
 
 cleanup() {
@@ -416,8 +386,11 @@ brief() {
   local all='' data cleanup_count sessions visible hidden=0
   case ${1:-} in -a|--all) all=all; shift ;; esac
   (( $# == 0 )) || die 'usage: hq brief [-a|--all]'
+  load_agents "$all"
+  collect_capacity
   # Render fully, then cap without SIGPIPE or losing errors in producers.
   data=$(
+    capacity_line
     printf 'HQ brief\n'
     health_data false | jq -r '.[0:6][]|.message'
     discover
@@ -434,10 +407,9 @@ brief() {
       if (( hidden > 0 )); then hidden_notice "$hidden"; fi
       collect_projects
       jq -r '[.[]|select(.dirty>0 or .ahead>0)][:6][] | "project \(.name): \(.dirty) dirty, \(.ahead) ahead"' <<<"$PROJECTS"
-      if load_agents all; then
-        cleanup_count=$(cleanup_data 12 | jq length)
-        printf 'Cleanup: %s findings (hq cleanup)\n' "$cleanup_count"
-      fi
+      load_agents all
+      cleanup_count=$(cleanup_data 12 | jq length)
+      printf 'Cleanup: %s findings (hq cleanup)\n' "$cleanup_count"
     fi
     printf 'Next:\n'
     if [[ -f $MEMORY_DIR/MEMORY.md ]]; then
@@ -446,6 +418,14 @@ brief() {
   )
   head -30 <<<"$data"
 }
+
+# Shared repo snapshots and janitor policy contain no persistent session registry.
+# shellcheck source=lib/hq-repos.sh
+source "$HQ_DIR/lib/hq-repos.sh"
+# shellcheck source=lib/hq-capacity.sh
+source "$HQ_DIR/lib/hq-capacity.sh"
+# shellcheck source=lib/hq-janitor.sh
+source "$HQ_DIR/lib/hq-janitor.sh"
 
 command=${1:-help}
 (( $# == 0 )) || shift
@@ -456,6 +436,9 @@ case $command in
   stop) stop_session "$@" ;;
   cleanup) cleanup "$@" ;;
   health) health "$@" ;;
+  capacity) (( $# == 0 )) || die 'usage: hq capacity'; load_agents; collect_capacity; capacity_line ;;
+  janitor) janitor "$@" ;;
+  _scan-repo) repo_row "$@" ;;
   brief) brief "$@" ;;
   memory) [[ ${1:-} = check && $# == 1 ]] || die 'usage: hq memory check'; memory_check ;;
   help|-h|--help) usage ;;

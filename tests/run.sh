@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-fixture=$(mktemp -d)
+fixture=$(mktemp -d /tmp/claude-hq-tests.XXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT
 export HOME=$fixture/home
 export XDG_CONFIG_HOME=$HOME/.config
+export XDG_STATE_HOME=$HOME/.local/state
+export TMPDIR=$fixture/tmp
 export CLAUDE_CONFIG_DIR=$HOME/.claude
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 export HQ_ROOTS=$HOME/dev:$HOME/other
@@ -14,7 +16,10 @@ export AGENTS_FILE=$fixture/agents.json
 export SYSTEMS_FILE=$fixture/systems.json ALERTS_FILE=$fixture/alerts.json
 export SIGNAL_LOG=$fixture/signals
 export HQ_TEST_REPO_ROOT=$repo
-mkdir -p "$HOME/dev" "$HOME/other" "$fixture/stubs"
+export HQ_MEMINFO_FILE=$fixture/meminfo HQ_LOADAVG_FILE=$fixture/loadavg
+printf 'MemAvailable: 16777216 kB\n' >"$HQ_MEMINFO_FILE"
+printf '0.4 0.3 0.2 1/20 1\n' >"$HQ_LOADAVG_FILE"
+mkdir -p "$HOME/dev" "$HOME/other" "$fixture/stubs" "$TMPDIR" "$fixture/system-tmp"
 export PATH=$fixture/stubs:$PATH
 # Tests never invoke a real Claude command or access the network.
 cat >"$fixture/stubs/claude" <<'STUB'
@@ -57,8 +62,51 @@ esac
 STUB
 cat >"$fixture/stubs/df" <<'STUB'
 #!/usr/bin/env bash
+if [[ " $* " == *' -PT '* ]]; then
+  target=${*: -1}
+  kind=ext4; pct=${DISK_PCT:-20}
+  [[ $target != / ]] || pct=${ROOT_DISK_PCT:-$pct}
+  [[ $target != "$HOME" ]] || pct=${HOME_DISK_PCT:-$pct}
+  if [[ $target == /tmp ]]; then kind=${TMP_FS:-tmpfs}; pct=${SYSTEM_TMP_PCT:-${TMP_PCT:-20}};
+  elif [[ $target == "${TMPDIR:-$HOME/.cache/tmp}" ]]; then kind=${TMP_FS:-tmpfs}; pct=${CUSTOM_TMP_PCT:-${TMP_PCT:-20}}; fi
+  printf 'Filesystem Type 1024-blocks Used Available Capacity Mounted on\n'
+  printf 'fixture %s 100 20 80 %s%% /\n' "$kind" "$pct"
+  exit 0
+fi
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
 printf 'fixture 100 20 80 %s%% /\n' "${DISK_PCT:-20}"
+STUB
+cat >"$fixture/stubs/nproc" <<'STUB'
+#!/usr/bin/env bash
+printf '1\n'
+STUB
+REAL_FIND=$(type -P find); REAL_NICE=$(type -P nice); REAL_IONICE=$(type -P ionice)
+REAL_TIMEOUT=$(type -P timeout)
+export REAL_FIND REAL_NICE REAL_IONICE REAL_TIMEOUT SYSTEM_TMP_FIXTURE=$fixture/system-tmp
+export SCHED_LOG=$fixture/scheduling TIMEOUT_LOG=$fixture/timeouts
+cat >"$fixture/stubs/find" <<'STUB'
+#!/usr/bin/env bash
+args=("$@")
+for i in "${!args[@]}"; do
+  if [[ ${args[$i]} == /tmp ]]; then args[$i]=$SYSTEM_TMP_FIXTURE; break; fi
+done
+exec "$REAL_FIND" "${args[@]}"
+STUB
+cat >"$fixture/stubs/nice" <<'STUB'
+#!/usr/bin/env bash
+printf 'nice %s\n' "$*" >>"$SCHED_LOG"
+exec "$REAL_NICE" "$@"
+STUB
+cat >"$fixture/stubs/ionice" <<'STUB'
+#!/usr/bin/env bash
+printf 'ionice %s\n' "$*" >>"$SCHED_LOG"
+exec "$REAL_IONICE" "$@"
+STUB
+cat >"$fixture/stubs/timeout" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$TIMEOUT_LOG"
+if [[ ${FAIL_REPO_SCAN:-0} == 1 && " $* " == *' _scan-repo '* ]]; then exit 124; fi
+exec "$REAL_TIMEOUT" "$@"
 STUB
 cat >"$fixture/stubs/systemctl" <<'STUB'
 #!/usr/bin/env bash
@@ -164,12 +212,12 @@ ok 'sessions: grouping, filter, status/state, age, completed sessions'
 before=$(git -C "$HOME/dev/alpha" status --porcelain=v1)
 out=$(hq cleanup --idle-hours 12)
 contains "$out" 'report only'
-contains "$out" 'claude stop idle1'
-contains "$out" 'claude rm done1'
+contains "$out" "claude stop 'idle1'"
+contains "$out" "claude rm 'done1'"
 contains "$out" 'worktree remove'
 contains "$out" 'branch -d'
 contains "$out" 'dirty entries'
-contains "$out" 'hq stop 87654321'
+contains "$out" "hq stop '87654321'"
 [[ $out != *'claude rm 87654321'* ]] || fail 'interactive cleanup suggested background remove'
 [[ $(git -C "$HOME/dev/alpha" status --porcelain=v1) == "$before" ]] || fail 'cleanup modified repository'
 git -C "$HOME/dev/alpha" show-ref --verify --quiet refs/heads/merged-topic || fail 'cleanup deleted branch'
@@ -249,10 +297,14 @@ export BESZEL_URL='' BESZEL_EMAIL='' BESZEL_PASSWORD=''
 checkout=$fixture/checkout
 mkdir -p "$checkout/bin" "$checkout/.claude" "$checkout/memory/projects"
 cp "$repo/bin/hq" "$checkout/bin/hq"
+cp -R "$repo/lib" "$checkout/"
 cp "$repo/install.sh" "$repo/config.example.env" "$checkout/"
 cp "$repo/memory/MEMORY.md" "$checkout/memory/"
 printf '{"permissions":{"allow":["Bash(git status)"]},"extra":"keep"}\n' >"$checkout/.claude/settings.local.json"
-bash "$checkout/install.sh" >/dev/null
+install_output=$(bash "$checkout/install.sh")
+contains "$install_output" 'systemctl --user enable --now claude-hq-janitor.timer'
+contains "$install_output" '"cleanupPeriodDays": 14'
+[[ ! -e $HOME/.claude/settings.json ]] || fail 'installer edited user Claude settings'
 [[ -f $XDG_CONFIG_HOME/claude-hq/config.env ]] || fail 'installer did not seed config'
 jq -e --arg memory "$checkout/memory" '.autoMemoryDirectory==$memory and .extra=="keep" and .permissions.allow==["Bash(git status)"]' "$checkout/.claude/settings.local.json" >/dev/null || fail 'installer did not merge settings'
 [[ -L $HOME/.local/bin/hq && $(readlink "$HOME/.local/bin/hq") == "$checkout/bin/hq" ]] || fail 'installer symlink'
@@ -276,5 +328,201 @@ git init -q -b main "$HOME/dev/unborn"
 assert_json "$(hq projects --json)" 'any(.[];.name=="unborn" and .lastCommitAgeSeconds==null)' 'unborn repository'
 ok 'edge cases: ambiguous project paths, unborn repository'
 
-[[ ! -e $HOME/.claude ]] || fail 'tests touched Claude configuration'
+[[ ! -e $HOME/.claude ]] || fail 'early tests touched Claude configuration'
+
+expect_refusal() {
+  local expected=$1 code=0 output
+  shift
+  output=$("$@" 2>&1) || code=$?
+  [[ $code == 3 ]] || fail "spawn refusal code $code"
+  [[ $(awk 'END{print NR}' <<<"$output") == 1 ]] || fail 'spawn refusal must be one line'
+  contains "$output" "$expected"
+}
+contains "$(hq capacity)" 'sessions 7/40 · mem 16G avail · load 0.4/core · disk 20% · tmp 20%'
+expect_refusal 'sessions 7/7' env HQ_MAX_SESSIONS=7 "$repo/bin/hq" spawn alpha -- test
+expect_refusal 'memory' env HQ_MIN_MEM_MB=20000 "$repo/bin/hq" spawn alpha -- test
+expect_refusal 'load' env HQ_MAX_LOAD=0.1 "$repo/bin/hq" spawn alpha -- test
+expect_refusal 'disk 90%' env DISK_PCT=90 "$repo/bin/hq" spawn alpha -- test
+expect_refusal 'disk 90%' env HOME_DISK_PCT=90 ROOT_DISK_PCT=20 "$repo/bin/hq" spawn alpha -- test
+expect_refusal 'tmpfs 80%' env TMP_PCT=80 "$repo/bin/hq" spawn alpha -- test
+expect_refusal 'tmpfs 80%' env SYSTEM_TMP_PCT=20 CUSTOM_TMP_PCT=80 "$repo/bin/hq" spawn alpha -- test
+contains "$(TMP_FS=ext4 TMP_PCT=99 hq spawn alpha -- test)" 'abc123'
+contains "$(HQ_MAX_SESSIONS=1 DISK_PCT=99 hq spawn alpha --force -- test)" 'abc123'
+contains "$(HQ_MAX_SESSIONS=8 HQ_MIN_MEM_MB=16384 HQ_MAX_LOAD=0.4 DISK_PCT=89 TMP_PCT=79 hq spawn alpha -- test)" 'abc123'
+ok 'capacity: every admission limit, boundaries, one-line exit 3, explicit force'
+
+janitor_root=$HOME/janitor-projects
+mkdir -p "$janitor_root"
+init_repo "$janitor_root/tools"
+printf '.claude/\n' >"$janitor_root/tools/.gitignore"
+printf 'base\n' >"$janitor_root/tools/tracked"
+git -C "$janitor_root/tools" add .
+git -C "$janitor_root/tools" -c user.name=Fixture -c user.email=fixture.invalid commit -qm base
+bucket=$janitor_root/tools-worktrees
+mkdir -p "$bucket"
+for entry in clean dirty unmerged ignored; do
+  git -C "$janitor_root/tools" worktree add -q -b "hq/$entry" "$bucket/$entry"
+done
+printf 'unmerged\n' >"$bucket/unmerged/feature"
+git -C "$bucket/unmerged" add feature
+git -C "$bucket/unmerged" -c user.name=Fixture -c user.email=fixture.invalid commit -qm feature
+printf 'dirty\n' >"$bucket/dirty/untracked"
+printf 'cache\n' >>"$janitor_root/tools/.git/info/exclude"
+printf 'ignored but valuable\n' >"$bucket/ignored/cache"
+for entry in live recent; do
+  git -C "$janitor_root/tools" worktree add -q -b "hq/$entry" "$janitor_root/tools/.claude/worktrees/$entry"
+done
+mkdir -p "$janitor_root/tools/.claude/worktrees/live/subdir"
+git -C "$janitor_root/tools" branch hq/orphan
+git -C "$janitor_root/tools" branch topic/keep
+# A committed-and-merged branch exercises the other safe worktree condition.
+git -C "$janitor_root/tools" worktree add -q -b so/merged "$bucket/merged"
+printf 'merged\n' >"$bucket/merged/merged"
+git -C "$bucket/merged" add merged
+git -C "$bucket/merged" -c user.name=Fixture -c user.email=fixture.invalid commit -qm merged
+git -C "$janitor_root/tools" merge -q --ff-only so/merged
+for entry in "$bucket/clean" "$bucket/dirty" "$bucket/unmerged" "$bucket/ignored" "$bucket/merged" "$janitor_root/tools/.claude/worktrees/live"; do
+  "$REAL_FIND" -P "$entry" -exec touch -d '3 hours ago' {} +
+done
+now=$(date +%s)
+janitor_agents=$fixture/janitor-agents.json
+jq -n --arg root "$janitor_root/tools" --arg bucket "$bucket" --argjson now "$now" '[
+ {id:"done-old",pid:999980,sessionId:"done-old-session",kind:"background",state:"done",status:"idle",cwd:$root,startedAt:(($now-18000)*1000)},
+ {id:"done-recent",pid:999979,sessionId:"done-recent-session",kind:"background",state:"done",status:"idle",cwd:$root,startedAt:(($now-180000)*1000)},
+ {id:"done-dirty",pid:999978,sessionId:"done-dirty-session",kind:"background",state:"done",status:"idle",cwd:($bucket+"/dirty"),startedAt:(($now-18000)*1000)},
+ {id:"done-unmerged",pid:999977,sessionId:"done-unmerged-session",kind:"background",state:"done",status:"idle",cwd:($bucket+"/unmerged"),startedAt:(($now-18000)*1000)},
+ {id:"idle-old",pid:999976,sessionId:"idle-old-session",kind:"background",state:"idle",status:"idle",cwd:$root,startedAt:(($now-60000)*1000)},
+ {id:"waiting-old",pid:999975,sessionId:"waiting-old-session",kind:"background",state:"waiting",status:"idle",cwd:$root,startedAt:(($now-60000)*1000)},
+ {id:"busy-old",pid:999974,sessionId:"busy-old-session",kind:"background",state:"working",status:"busy",cwd:$root,startedAt:(($now-180000)*1000)},
+ {id:"active-recent",pid:999973,sessionId:"active-recent-session",kind:"background",state:"waiting",status:"idle",cwd:$root,startedAt:(($now-180000)*1000)},
+ {id:"idle-recent",pid:999972,sessionId:"idle-recent-session",kind:"background",state:"waiting",status:"idle",cwd:$root,startedAt:(($now-3600)*1000)},
+ {pid:999971,sessionId:"interactive-old",kind:"interactive",status:"idle",cwd:$root,startedAt:(($now-180000)*1000)},
+ {pid:999970,sessionId:"remote-old",kind:"remote",status:"idle",cwd:$root,startedAt:(($now-180000)*1000)},
+ {id:"live-wt",pid:999969,sessionId:"session-live-temp",kind:"background",state:"working",status:"busy",cwd:($root+"/.claude/worktrees/live/subdir"),startedAt:($now*1000)}
+]' >"$janitor_agents"
+# Contents deliberately are not a transcript; janitor must stat, never parse.
+encoded=${janitor_root//[\/.]/-}-tools
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/$encoded" "$CLAUDE_CONFIG_DIR/projects/encoding-fallback"
+printf 'not transcript JSON\n' >"$CLAUDE_CONFIG_DIR/projects/$encoded/done-recent-session.jsonl"
+printf 'not transcript JSON\n' >"$CLAUDE_CONFIG_DIR/projects/encoding-fallback/active-recent-session.jsonl"
+for entry in claude-session-stale session-live-temp claude-recent arbitrary-cache claude-container/session-live-temp/scratchpad; do mkdir -p "$TMPDIR/$entry"; done
+init_repo "$TMPDIR/claude-nested-git/repo"
+printf 'unmerged local data\n' >"$TMPDIR/claude-nested-git/repo/untracked"
+printf 'old scratch\n' >"$TMPDIR/claude-session-stale/file"
+printf 'keep target\n' >"$fixture/outside-target"
+ln -s "$fixture/outside-target" "$TMPDIR/claude-session-stale/link"
+ln -s "$fixture/outside-target" "$TMPDIR/claude-link"
+for entry in claude-session-stale session-live-temp arbitrary-cache claude-container claude-nested-git; do "$REAL_FIND" -P "$TMPDIR/$entry" -exec touch -h -d '5 days ago' {} +; done
+printf 'old\n' >"$SYSTEM_TMP_FIXTURE/old-user-file"
+printf 'recent\n' >"$SYSTEM_TMP_FIXTURE/recent-user-file"
+touch -d '4 days ago' "$SYSTEM_TMP_FIXTURE/old-user-file"
+ln -s "$fixture/outside-target" "$SYSTEM_TMP_FIXTURE/symlink"
+init_repo "$SYSTEM_TMP_FIXTURE/git-work"
+printf 'keep git data\n' >"$SYSTEM_TMP_FIXTURE/git-work/untracked"
+touch -d '4 days ago' "$SYSTEM_TMP_FIXTURE/git-work/untracked"
+signals_before=$(wc -l <"$SIGNAL_LOG")
+out=$(HQ_ROOTS="$janitor_root" AGENTS_FILE="$janitor_agents" TMP_PCT=75 hq janitor)
+contains "$out" 'Janitor dry-run'
+contains "$out" 'remove done session done-old'
+contains "$out" 'stop idle background idle-old'
+contains "$out" 'report: idle interactive interactive-old'
+contains "$out" 'remove merged worktree'
+contains "$out" 'claude-session-stale'
+[[ $out != *'remove done session done-recent'* && $out != *'stop idle background active-recent'* && $out != *'stop idle background busy-old'* ]] || fail 'janitor ignored recent activity or busy state'
+[[ $(wc -l <"$SIGNAL_LOG") == "$signals_before" && -d $bucket/clean && -f $TMPDIR/claude-session-stale/file ]] || fail 'dry-run mutated work'
+[[ ! -f $XDG_STATE_HOME/claude-hq/janitor.log ]] || fail 'dry-run wrote applied-action log'
+incomplete=$(HQ_ROOTS="$janitor_root" AGENTS_FILE="$janitor_agents" FAIL_REPO_SCAN=1 hq janitor 2>/dev/null)
+[[ $incomplete != *'remove done session'* && $incomplete != *'remove merged worktree'* ]] || fail 'incomplete snapshot authorized deletion'
+tuned=$(HQ_ROOTS="$janitor_root" AGENTS_FILE="$janitor_agents" HQ_DONE_HOURS=100 HQ_IDLE_HOURS=100 HQ_WORKTREE_HOURS=100 HQ_TMP_DAYS=100 hq janitor)
+[[ $tuned != *'remove done session'* && $tuned != *'stop idle background'* && $tuned != *'remove merged worktree'* && $tuned != *'remove stale Claude temp'* ]] || fail 'janitor threshold tuning ignored'
+ok 'janitor dry-run: done, idle, busy, transcript mtime/fallback, interactive report, no mutation'
+
+mkdir -p "$XDG_STATE_HOME/claude-hq"
+truncate -s 1048576 "$XDG_STATE_HOME/claude-hq/janitor.log"
+out=$(HQ_ROOTS="$janitor_root" AGENTS_FILE="$janitor_agents" TMP_PCT=75 hq janitor --apply)
+contains "$out" 'Removed done-old'
+[[ ! -d $bucket/clean && ! -d $bucket/merged ]] || fail 'safe merged worktrees not removed'
+[[ -d $bucket/dirty && -f $bucket/dirty/untracked && -d $bucket/unmerged && -d $janitor_root/tools/.claude/worktrees/live && -d $janitor_root/tools/.claude/worktrees/recent ]] || fail 'janitor removed dirty, unmerged, live, or recent worktree'
+[[ -f $bucket/ignored/cache ]] || fail 'ignored worktree data removed'
+if git -C "$janitor_root/tools" show-ref --verify --quiet refs/heads/hq/orphan; then fail 'merged prefixed branch retained'; fi
+git -C "$janitor_root/tools" show-ref --verify --quiet refs/heads/topic/keep || fail 'unapproved branch prefix deleted'
+[[ ! -d $TMPDIR/claude-session-stale && ! -f $SYSTEM_TMP_FIXTURE/old-user-file ]] || fail 'stale temp not removed'
+[[ -d $TMPDIR/session-live-temp && -d $TMPDIR/claude-container/session-live-temp/scratchpad && -d $TMPDIR/claude-recent && -d $TMPDIR/arbitrary-cache ]] || fail 'janitor removed live, recent, or unrelated temp'
+[[ -f $fixture/outside-target && -L $TMPDIR/claude-link && -L $SYSTEM_TMP_FIXTURE/symlink && -f $SYSTEM_TMP_FIXTURE/git-work/untracked && -f $SYSTEM_TMP_FIXTURE/recent-user-file ]] || fail 'symlink, git work, or fresh tmp data damaged'
+[[ -f $TMPDIR/claude-nested-git/repo/untracked ]] || fail 'Git work nested in Claude temp removed'
+[[ -f $XDG_STATE_HOME/claude-hq/janitor.log.1 ]] || fail 'log did not rotate'
+contains "$(cat "$XDG_STATE_HOME/claude-hq/janitor.log")" 'applied remove done session done-old'
+[[ $(jq -s '[.[]|select(.args==["rm","idle-old"] or .args==["rm","waiting-old"])]|length' "$CALL_LOG") == 0 ]] || fail 'idle conversations deleted'
+[[ $(rg -c -- '-INT 999976' "$SIGNAL_LOG") == 2 ]] || fail 'idle background not signalled twice'
+[[ $(rg -c -- '-INT 999971' "$SIGNAL_LOG" || true) == '' ]] || fail 'interactive stopped by default'
+contains "$(cat "$SCHED_LOG")" 'nice -n 19'
+contains "$(cat "$SCHED_LOG")" 'ionice -c3'
+contains "$(cat "$TIMEOUT_LOG")" '5 git --no-optional-locks'
+ok 'janitor apply: safe worktrees/branches, stale temp, negative cases, signals, scheduling, timeouts, log rotation'
+
+jq '[.[]|select(.kind=="interactive" or .kind=="remote")]' "$janitor_agents" >"$fixture/interactive-agents.json"
+out=$(HQ_ROOTS="$janitor_root" AGENTS_FILE="$fixture/interactive-agents.json" HQ_JANITOR_STOP_INTERACTIVE=1 hq janitor --apply)
+contains "$out" 'stop idle interactive interactive-old'
+[[ $(rg -c -- '-INT 999971' "$SIGNAL_LOG") == 2 && $(rg -c -- '-INT 999970' "$SIGNAL_LOG") == 2 ]] || fail 'interactive opt-in stop missing'
+# A held flock must suppress the entire janitor without querying agents.
+exec 8>"$XDG_STATE_HOME/claude-hq/janitor.lock"
+flock -n 8
+calls_before=$(wc -l <"$CALL_LOG")
+contains "$(HQ_ROOTS="$janitor_root" AGENTS_FILE="$janitor_agents" hq janitor --apply)" 'another run holds the lock'
+[[ $(wc -l <"$CALL_LOG") == "$calls_before" ]] || fail 'locked janitor queried agents'
+exec 8>&-
+# The fixture checkout has its own protected memory, even if TMPDIR points there.
+mkdir -p "$checkout/memory/session-stale"
+printf 'must survive\n' >"$checkout/memory/session-stale/file"
+"$REAL_FIND" -P "$checkout/memory/session-stale" -exec touch -d '5 days ago' {} +
+HQ_ROOTS="$janitor_root" AGENTS_FILE="$fixture/interactive-agents.json" TMPDIR="$checkout/memory" "$checkout/bin/hq" janitor --apply >/dev/null
+[[ -f $checkout/memory/session-stale/file ]] || fail 'HQ memory touched'
+ok 'janitor: interactive opt-in, exclusive lock, HQ memory protected'
+
+# A worktree bucket can be the only project entry under a configured root.
+linked_root=$HOME/linked-projects
+init_repo "$HOME/linked-main"
+mkdir -p "$linked_root/linked-main-worktrees"
+git -C "$HOME/linked-main" worktree add -q -b hq/linked "$linked_root/linked-main-worktrees/old"
+"$REAL_FIND" -P "$linked_root/linked-main-worktrees/old" -exec touch -d '3 hours ago' {} +
+printf '[]\n' >"$fixture/no-agents.json"
+out=$(HQ_ROOTS="$linked_root" AGENTS_FILE="$fixture/no-agents.json" hq janitor)
+contains "$out" "remove merged worktree $linked_root/linked-main-worktrees/old"
+[[ -d $HOME/linked-main/.git ]] || fail 'primary repo damaged'
+unknown_root=$HOME/unknown-projects
+mkdir -p "$unknown_root"
+init_repo "$unknown_root/custom"
+git -C "$unknown_root/custom" branch -m main trunk
+git -C "$unknown_root/custom" worktree add -q -b hq/unproven "$unknown_root/custom-worktrees/old"
+"$REAL_FIND" -P "$unknown_root/custom-worktrees/old" -exec touch -d '3 hours ago' {} +
+out=$(HQ_ROOTS="$unknown_root" AGENTS_FILE="$fixture/no-agents.json" hq janitor)
+[[ $out != *'remove merged worktree'* && $out != *'delete merged branch'* ]] || fail 'unknown default branch allowed deletion'
+mkdir -p "$HOME/.cache/tmp/claude-default-old"
+printf 'stale\n' >"$HOME/.cache/tmp/claude-default-old/file"
+printf 'outside scratch root\n' >"$HOME/.cache/outside-old"
+"$REAL_FIND" -P "$HOME/.cache/tmp/claude-default-old" -exec touch -d '5 days ago' {} +
+env -u TMPDIR HQ_ROOTS="$HOME/missing" AGENTS_FILE="$fixture/no-agents.json" "$repo/bin/hq" janitor --apply >/dev/null
+[[ ! -e $HOME/.cache/tmp/claude-default-old && -f $HOME/.cache/outside-old ]] || fail 'default TMPDIR cleanup escaped its root'
+ok 'janitor: discover sibling worktree buckets through Git metadata'
+
+stress_root=$HOME/stress-projects
+mkdir -p "$stress_root"
+for ((i=0;i<20;i++)); do init_repo "$stress_root/p$i"; done
+jq -n --arg root "$stress_root" --argjson now "$(date +%s)" '[range(0;40)|{id:("stress-"+tostring),sessionId:("stress-session-"+tostring),pid:(900000+.),kind:"background",state:"working",status:"busy",cwd:($root+"/p"+(.%20|tostring)),startedAt:($now*1000)}]' >"$fixture/stress-agents.json"
+for action in brief janitor; do
+  calls_before=$(jq -s '[.[]|select(.args[0]=="agents")]|length' "$CALL_LOG")
+  started_ns=$(date +%s%N)
+  out=$(HQ_ROOTS="$stress_root" AGENTS_FILE="$fixture/stress-agents.json" hq "$action")
+  elapsed_ms=$(( ($(date +%s%N)-started_ns)/1000000 ))
+  [[ $elapsed_ms -lt 3000 ]] || fail "$action took ${elapsed_ms}ms (limit 3000ms)"
+  calls_after=$(jq -s '[.[]|select(.args[0]=="agents")]|length' "$CALL_LOG")
+  [[ $((calls_after-calls_before)) == 1 ]] || fail "$action queried agents more than once"
+  if [[ $action == brief ]]; then
+    [[ $(awk 'END{print NR}' <<<"$out") -le 30 ]] || fail 'stress brief exceeds 30 lines'
+    contains "$(head -1 <<<"$out")" 'sessions 40/40'
+  fi
+  printf 'timing: %s %sms (40 sessions, 20 repos)\n' "$action" "$elapsed_ms"
+done
+ok 'performance: one agent query, 40 sessions / 20 repos, each <3s, brief <=30 lines'
+
 printf 'PASS: %s checks; fixture HOME + command stubs, no sessions or network.\n' "$tests"
