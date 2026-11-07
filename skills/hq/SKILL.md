@@ -12,15 +12,15 @@ When installed as a plugin without hq on PATH, use
 | Orient / daily start | `hq brief` |
 | Find work | `hq projects` (`--json` for structured output) |
 | Start a project task | `hq spawn <project> [-n title] [-w [name]] [--mode mode] -- "<prompt>"` |
-| Check work | `hq sessions [project]`; `-a` includes completed |
+| Check work | `hq sessions [project]`; `-a` includes completed and older idle |
 | Ask child for status | Use `ListAgents` and `SendMessage` after checking sessions |
 | Recover context | `/recap` in child; only if needed, `claude -p --resume <id> "<question>"` (adds a turn) |
 | Read logs | `claude logs <id>` |
-| Stop a session | After user approval, `hq stop <id>` (SIGINT twice, then `claude rm`) |
+| Stop a session | After user approval, `hq stop <background-id|sessionId-prefix>` (SIGINT twice; rm only for background ids) |
 | Find cleanup candidates | `hq cleanup [--idle-hours 12]` (report only) |
 | Check server | `hq health`; `-v` shows all, `--json` gives structured results |
 | Check memory bounds | `hq memory check` |
-| Clean disk | User's existing machine-cleanup skill when requested |
+| Clean disk | Use a disk-cleanup skill if one is installed |
 
 Spawn using `hq spawn`, never just `cd`. Projects resolve from HQ_ROOTS.
 Use `--` after a bare `-w` to separate the prompt from an optional worktree name.

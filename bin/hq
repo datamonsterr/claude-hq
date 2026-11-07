@@ -36,7 +36,7 @@ Usage: hq projects [--json]
        hq stop <id>
        hq cleanup [--idle-hours N] [--json]
        hq health [-v] [--json]
-       hq brief
+       hq brief [-a|--all]
        hq memory check
 Projects are repositories directly under HQ_ROOTS (colon-separated; default ~/dev).
 Use -- after a bare -w to separate the prompt from an optional worktree name.
@@ -107,10 +107,11 @@ collect_projects() {
       fi
       jq -cn --arg name "${dir##*/}" --arg path "$dir" --arg branch "$branch" \
         --argjson dirty "$dirty" --argjson ahead "$ahead" --argjson behind "$behind" \
-        --argjson age "$age" --argjson agents "$AGENTS" '
+        --argjson age "$age" --argjson agents "$AGENTS" --argjson now "$NOW" '
         {name:$name,path:$path,branch:$branch,dirty:$dirty,ahead:$ahead,behind:$behind,
          lastCommitAgeSeconds:$age,liveSessions:([$agents[] |
            select(.state != "done" and .state != "completed" and .state != "stopped") |
+           select(.status != "idle" or ($now - ((.startedAt // ($now*1000))/1000)) < 86400) |
            select(.cwd == $path or ((.cwd // "") | startswith($path+"/")))] | length)}'
     done | jq -s 'sort_by(.name,.path)'
   )
@@ -172,13 +173,20 @@ session_data() {
   jq --argjson projects "$paths" --argjson now "$NOW" '
     map(. as $s | ($projects | map(. as $p | select($s.cwd == $p.path or
       (($s.cwd // "") | startswith($p.path+"/")))) | sort_by(.path|length) | last) as $p |
-      . + {project:($p.name // "(other)"),projectPath:($p.path // ""),
+      . + {id:(.id // (.sessionId[0:8])),state:(.state // .status),
+           project:($p.name // "(other)"),projectPath:($p.path // ""),
            ageSeconds:([0,($now - ((.startedAt // ($now*1000))/1000|floor))]|max)}) |
     sort_by(.project,.projectPath,.startedAt)' <<<"$AGENTS"
 }
 
+visible_sessions() {
+  jq '[.[] | select(.kind != "interactive" or .status != "idle" or .ageSeconds < 86400)]'
+}
+
+hidden_notice() { printf '%s older idle hidden, -a to show\n' "$1"; }
+
 sessions() {
-  local all='' json=false project='' dir='' data
+  local all='' json=false project='' dir='' data visible hidden=0
   while (( $# )); do
     case $1 in
       -a|--all) all=all ;;
@@ -192,17 +200,28 @@ sessions() {
   [[ -z $project ]] || dir=$(resolve_project "$project")
   load_agents "$all"; data=$(session_data)
   if [[ -n $dir ]]; then data=$(jq --arg dir "$dir" '[.[]|select(.projectPath == $dir)]' <<<"$data"); fi
-  if $json; then printf '%s\n' "$data"; return; fi
+  if [[ -z $all ]]; then
+    visible=$(visible_sessions <<<"$data")
+    hidden=$(( $(jq length <<<"$data") - $(jq length <<<"$visible") ))
+    data=$visible
+  fi
+  if $json; then
+    printf '%s\n' "$data"
+    if (( hidden > 0 )); then hidden_notice "$hidden" >&2; fi
+    return
+  fi
   jq -r 'group_by(.projectPath)[] | "\(.[0].project)\(if .[0].projectPath == "" then "" else " (\(.[0].projectPath))" end)",
-    (.[] | "  \(.id)\t\(.state // "?")/\(.status // "?")\t\((.ageSeconds/3600|floor))h\t\((.name // "(unnamed)")|gsub("[\\r\\n\\t]";" "))")' <<<"$data"
+    (.[] | "  \(.id)\t\(.state // "?")\t\((.ageSeconds/3600|floor))h\t\((.name // "(unnamed)")|gsub("[\\r\\n\\t]";" "))")' <<<"$data"
   [[ $(jq length <<<"$data") != 0 ]] || printf 'No sessions.\n'
+  if (( hidden > 0 )); then hidden_notice "$hidden"; fi
 }
 
 stop_session() {
-  (( $# == 1 )) || die 'usage: hq stop <id>'
-  local record pid
+  (( $# == 1 )) && [[ -n $1 ]] || die 'usage: hq stop <background-id|sessionId-prefix>'
+  local record pid background_id
   load_agents all
-  record=$(jq --arg id "$1" '[.[]|select(.id == $id)]' <<<"$AGENTS")
+  record=$(jq --arg id "$1" '[.[]|select(.id == $id or
+    (.id == null and ((.sessionId // "")|startswith($id))))]' <<<"$AGENTS")
   [[ $(jq length <<<"$record") == 1 ]] || die "session id not found or not unique: $1"
   pid=$(jq -r '.[0].pid // empty' <<<"$record")
   if [[ -n $pid ]]; then
@@ -214,7 +233,12 @@ stop_session() {
   elif ! jq -e '.[0].state == "done" or .[0].state == "completed" or .[0].state == "stopped"' <<<"$record" >/dev/null; then
     die 'live session has no pid; refusing to remove it'
   fi
-  claude rm "$1"
+  background_id=$(jq -r '.[0]|select(.kind == "background")|.id // empty' <<<"$record")
+  if [[ -n $background_id ]]; then
+    claude rm "$background_id"
+  else
+    printf 'Sent SIGINT twice to %s; claude rm only applies to background ids.\n' "$1"
+  fi
 }
 
 cleanup_item() {
@@ -225,17 +249,23 @@ cleanup_item() {
 }
 
 cleanup_data() {
-  local hours=$1 dir base branch current field wt='' wtcommit='' dirty command_remove command_branch id state age
+  local hours=$1 dir base branch current field wt='' wtcommit='' dirty command_remove command_branch id state age background
   {
-    while IFS=$'\t' read -r id state age; do
+    while IFS=$'\t' read -r id state age background; do
       [[ -n $id ]] || continue
-      printf -v command_remove 'claude rm %q' "$id"
-      printf -v command_branch 'claude stop %q' "$id"
-      cleanup_item session '' "$id $state; session age ${age}h (idle duration unavailable)" "$command_branch" "$command_remove"
+      if [[ $background == true ]]; then
+        printf -v command_remove 'claude rm %q' "$id"
+        printf -v command_branch 'claude stop %q' "$id"
+        cleanup_item session '' "$id $state; session age ${age}h (idle duration unavailable)" "$command_branch" "$command_remove"
+      else
+        printf -v command_branch 'hq stop %q' "$id"
+        cleanup_item session '' "$id $state; session age ${age}h (idle duration unavailable)" "$command_branch"
+      fi
     done < <(jq -r --argjson now "$NOW" --argjson hours "$hours" '.[] |
       select(.state == "done" or .state == "completed" or .status == "idle") |
       select((.startedAt|type) == "number" and ($now - .startedAt/1000) > ($hours*3600)) |
-      [.id,(.state // .status),((($now-.startedAt/1000)/3600)|floor)]|@tsv' <<<"$AGENTS")
+      [(.id // (.sessionId[0:8])),(.state // .status),((($now-.startedAt/1000)/3600)|floor),
+       (.kind == "background" and .id != null)]|@tsv' <<<"$AGENTS")
     for dir in "${REPOS[@]}"; do
       current=$(git -C "$dir" symbolic-ref --short -q HEAD || true)
       base=$(git -C "$dir" symbolic-ref -q refs/remotes/origin/HEAD || true)
@@ -383,16 +413,25 @@ memory_check() {
 }
 
 brief() {
-  (( $# == 0 )) || die 'usage: hq brief'
-  local data cleanup_count
+  local all='' data cleanup_count sessions visible hidden=0
+  case ${1:-} in -a|--all) all=all; shift ;; esac
+  (( $# == 0 )) || die 'usage: hq brief [-a|--all]'
   # Render fully, then cap without SIGPIPE or losing errors in producers.
   data=$(
     printf 'HQ brief\n'
     health_data false | jq -r '.[0:6][]|.message'
     discover
-    if load_agents; then
-      session_data | jq -r '[.[]|select(.state != "done" and .state != "completed" and .state != "stopped")] |
-        group_by(.projectPath)[:6][] | "sessions \(.[0].project): \(length) live"'
+    if load_agents "$all"; then
+      sessions=$(session_data)
+      if [[ -z $all ]]; then
+        visible=$(visible_sessions <<<"$sessions")
+        hidden=$(( $(jq length <<<"$sessions") - $(jq length <<<"$visible") ))
+        sessions=$visible
+      fi
+      jq -r --arg all "$all" '[.[]|select(.state != "done" and .state != "completed" and .state != "stopped") |
+        select($all != "" or .status != "idle" or .ageSeconds < 86400)] |
+        group_by(.projectPath)[:6][] | "sessions \(.[0].project): \(length) live"' <<<"$sessions"
+      if (( hidden > 0 )); then hidden_notice "$hidden"; fi
       collect_projects
       jq -r '[.[]|select(.dirty>0 or .ahead>0)][:6][] | "project \(.name): \(.dirty) dirty, \(.ahead) ahead"' <<<"$PROJECTS"
       if load_agents all; then

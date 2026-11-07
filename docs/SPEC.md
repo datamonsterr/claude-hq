@@ -19,7 +19,7 @@ Verified on Claude Code 2.1.319 (2026-11-07):
 | Session summary | AI session name in `claude agents --json`; `/recap`; `claude -p --resume <id> "…"` (adds a turn); `ListAgents`/`SendMessage` cross-session messaging tools | nothing; skill tells HQ which to use and when |
 | Stop / remove | `claude stop <id>`, `claude rm <id>` | nothing |
 | Transcript/worktree cleanup | `cleanupPeriodDays`, worktree auto-removal, `claude purge` | `hq cleanup` *report only*: done/idle sessions > N h, merged-but-present worktrees/branches, dirty repos |
-| Disk cleanup | user's existing `machine-cleanup` skill | nothing |
+| Disk cleanup | a disk-cleanup skill, if installed | nothing |
 | Health + alerts | Beszel hub (already alerts, heartbeat) | `hq health`: compact Beszel summary via its PocketBase API; tiny local fallback (df, failed units) |
 | Memory | Built-in auto memory (MEMORY.md index + topic files, loaded at start, survives `/clear`) | layout + rules, stored in repo so it syncs via git (see Memory) |
 
@@ -35,7 +35,8 @@ claude-hq/
   bin/hq                    bash; deps: bash, git, jq, curl, claude
   skills/hq/SKILL.md        decision table: which built-in or hq command per intent
   commands/brief.md, spawn.md, cleanup.md
-  hooks/hooks.json          SessionStart: `hq brief`
+  .hq-root                  marker for the HQ-only SessionStart briefing
+  hooks/hooks.json          SessionStart: `hq brief` only if CLAUDE_PROJECT_DIR has .hq-root
   memory/                   durable memory (see Memory)
   systemd/claude-hq.service user unit keeping `claude remote-control --name HQ` alive in the repo dir
   install.sh, config.example.env, tests/run.sh, README.md
@@ -46,10 +47,14 @@ claude-hq/
 - `hq projects` — git repos directly under `HQ_ROOTS` (colon list, default `~/dev`), skipping `*-worktrees`. Row: name, branch, dirty count, ahead/behind, last commit age, live session count (from `claude agents --json` cwd prefix).
 - `hq spawn <project> [-n title] [-w [name]] [--mode <permission-mode>] [prompt…]` — runs the built-in command above in the project dir. Prints short id + title. Title default `"<project>: <first 6 words of prompt>"`.
 - `hq sessions [project]` — `claude agents --json` (add `--all` with `-a`) grouped by project root, columns id, state/status, age, name.
-- `hq stop <id>` — Clauster-proven sequence: SIGINT the session pid (from `claude agents --json`) twice, then `claude rm <id>` (plain `claude stop` reportedly SIGKILLs and can orphan the cloud session).
+- `hq stop <id>` — SIGINT the session pid twice, then `claude rm <id>` for background ids only. Interactive rows resolve by unambiguous sessionId prefix; display `.id // (.sessionId[0:8])` and `.state // .status` in sessions.
 - `hq cleanup [--idle-hours 12]` — report only, with exact commands to run (`claude stop/rm`, `git worktree remove`, `git branch -d`). Never deletes.
 - `hq health` — if `BESZEL_URL`, `BESZEL_EMAIL`, `BESZEL_PASSWORD` set: auth (`/api/collections/users/auth-with-password`), list systems (name, status, cpu/mem/disk %) and active alerts. Else/also: root+home disk %, `systemctl --failed` count. Warnings only by default, `-v` for all.
-- `hq brief` — <=30 lines: health warnings, live sessions per project, dirty/ahead projects, cleanup count, top of memory "Next".
+- `hq brief [-a]` — <=30 lines: health warnings, live sessions per project, dirty/ahead projects, cleanup count, top of memory "Next".
+
+Sessions and brief hide idle interactive rows aged >=24h by default, reporting
+"N older idle hidden, -a to show"; -a includes them. JSON sessions report the count
+on stderr. Projects LIVE counts only non-terminal rows that are non-idle or <24h.
 
 ## Memory
 

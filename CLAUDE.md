@@ -9,18 +9,19 @@ Use `-n` for a title, `-w [name]` for a built-in worktree, `--mode` if requested
 Pass the child needed context: background children may lack auto memory.
 Ask every child to finish with a summary of at most 2,000 tokens.
 
-Check `hq sessions` (or `-a` for completed sessions), then use `ListAgents` and
+Check `hq sessions` (`-a` includes completed and older idle sessions), then use `ListAgents` and
 `SendMessage` to ask the child for status. Use `/recap` in that session for context.
 Only if needed, `claude -p --resume <id> "<question>"` adds a turn to the session.
 Use `claude logs <id>` for built-in logs; do not parse transcript files.
-For graceful stop, use `hq stop <short-id>`: SIGINT twice, then `claude rm`.
+For graceful stop, use `hq stop <background-id|sessionId-prefix>`: SIGINT twice;
+`claude rm` only applies to background ids.
 Do not introduce a session registry, tmux manager, transcript parser, or own purge.
 
 Run `hq cleanup` to report done/idle candidates, merged worktrees/branches, and
 dirty repositories. Report findings and exact commands, then ask the user before
 stopping/removing sessions, worktrees, or branches. Never delete automatically.
 `hq health` shows warnings; `-v` includes healthy Beszel and local checks.
-Use the user's existing machine-cleanup skill for disk cleanup when requested.
+Use a disk-cleanup skill if one is installed when disk cleanup is requested.
 
 Use built-in auto memory in this repo's `memory/` (wired by `install.sh`).
 Keep `MEMORY.md` an index: one line per entry, at most 80 lines / about 6 KB.

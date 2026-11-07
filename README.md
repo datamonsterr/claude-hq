@@ -36,7 +36,8 @@ Remote Control available. Start with this checkout at `~/dev/claude-hq`.
    into the checkout's ignored `.claude/settings.local.json`, and copies
    `config.example.env` to `~/.config/claude-hq/config.env` only if absent.
    It respects `XDG_CONFIG_HOME`. Plugin installation enables the skill, slash
-   commands, and SessionStart hook in the HQ directory.
+   commands, and SessionStart hook in the HQ directory. The hook checks for
+   `.hq-root` in `CLAUDE_PROJECT_DIR`, so user-wide installs stay silent in children.
 3. Edit that user-owned config. `HQ_ROOTS` is a colon-separated list, default
    `$HOME/dev`; only its immediate Git repositories are projects. Directories
    ending in `-worktrees` are skipped. Optionally set `BESZEL_URL`,
@@ -88,11 +89,11 @@ Cleanup is a report followed by a user decision.
 |---|---|
 | `hq projects [--json]` | Name, branch, dirty count, ahead/behind, last commit age, live sessions |
 | `hq spawn <project> [-n title] [-w [name]] [--mode mode] [--] [prompt…]` | Built-in background Remote Control session in the project directory |
-| `hq sessions [project] [-a] [--json]` | Grouped id, state/status, age, name; `-a` adds completed sessions |
-| `hq stop <id>` | SIGINT the listed pid twice, then `claude rm <id>` |
+| `hq sessions [project] [-a] [--json]` | Grouped id, state (status fallback), age, name; `-a` adds completed and older idle sessions |
+| `hq stop <background-id\|sessionId-prefix>` | SIGINT twice; `claude rm` only for background ids |
 | `hq cleanup [--idle-hours 12] [--json]` | Report old done/idle sessions, merged worktrees/branches, dirty repositories |
 | `hq health [-v] [--json]` | Warnings, or all local and Beszel checks with `-v` |
-| `hq brief` | At most 30 lines of health, live sessions, dirty/ahead projects, cleanup count, memory Next |
+| `hq brief [-a]` | At most 30 lines of health, live sessions, dirty/ahead projects, cleanup count, memory Next |
 | `hq memory check` | Warn about an index over 80 lines or project notes over 40 |
 
 Examples:
@@ -110,6 +111,13 @@ stays with Claude. Use `claude logs`, `claude stop`, `claude rm`, and `claude pu
 for their built-in functions. HQ's graceful stop follows
 [Clauster](https://github.com/schubydoo/clauster)'s SIGINT-twice approach because
 plain stop can orphan the cloud session in the behavior recorded by the spec.
+Interactive rows use the first eight sessionId characters as their displayed id;
+`hq stop` accepts an unambiguous sessionId prefix and never calls rm for them.
+Sessions and brief hide idle interactive sessions older than 24 hours by default,
+with a hidden count; `-a` shows them. JSON sessions keep the array on stdout and
+print the hidden count to stderr. LIVE excludes completed sessions and idle
+sessions aged 24 hours or more. Use a disk-cleanup skill if one is installed
+when disk cleanup is requested.
 
 Cleanup uses **session age**, not measured idle duration: `claude agents --json`
 has a start timestamp but no idle timestamp. A merged branch means its tip is

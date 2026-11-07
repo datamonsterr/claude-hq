@@ -105,7 +105,10 @@ jq -n --arg root "$HOME/dev" --argjson now "$now" '[
   {pid:999998,id:"idle1",cwd:($root+"/alpha/.claude/worktrees/topic"),kind:"background",startedAt:(($now-90000)*1000),sessionId:"session-idle",name:"idle task",status:"idle",state:"waiting"},
   {id:"done1",cwd:($root+"/alpha"),kind:"background",startedAt:(($now-90000)*1000),sessionId:"session-done",name:"done task",status:"idle",state:"done"},
   {pid:999997,id:"neighbor",cwd:($root+"/alpha-more"),kind:"background",startedAt:($now*1000),sessionId:"session-neighbor",name:"neighbor task",status:"running",state:"working"},
-  {pid:999996,id:"other",cwd:($root+"/unregistered"),kind:"background",startedAt:($now*1000),sessionId:"session-other",name:"unregistered task",status:"running",state:"working"}
+  {pid:999996,id:"other",cwd:($root+"/unregistered"),kind:"background",startedAt:($now*1000),sessionId:"session-other",name:"unregistered task",status:"running",state:"working"},
+  {pid:999995,cwd:($root+"/alpha"),kind:"interactive",startedAt:(($now-3600)*1000),sessionId:"12345678-recent",name:"recent interactive",status:"idle"},
+  {pid:999994,cwd:($root+"/alpha"),kind:"interactive",startedAt:(($now-90000)*1000),sessionId:"87654321-older",name:"older interactive",status:"idle"},
+  {pid:999993,cwd:($root+"/alpha"),kind:"interactive",startedAt:(($now-90000)*1000),sessionId:"feedface-busy",name:"busy interactive",status:"running"}
 ]' >"$AGENTS_FILE"
 cat >"$SYSTEMS_FILE" <<'JSON'
 {"items":[
@@ -122,7 +125,7 @@ JSON
 
 out=$(hq projects --json)
 assert_json "$out" 'length==4 and ([.[].name]|index("skip-worktrees")|not)' 'project discovery / skipped worktree root'
-assert_json "$out" '.[]|select(.name=="alpha")|.dirty==1 and .ahead==1 and .behind==0 and .liveSessions==2 and .branch=="main"' 'project status and boundary matching'
+assert_json "$out" '.[]|select(.name=="alpha")|.dirty==1 and .ahead==1 and .behind==0 and .liveSessions==3 and .branch=="main"' 'project status and idle-aware live count'
 contains "$(hq projects)" 'AHEAD/BEHIND'
 assert_json "$(HQ_ROOTS='' hq projects --json)" 'length==3' 'default project root'
 assert_json "$(HQ_ROOTS="$HOME/missing" hq projects --json)" 'length==0' 'empty discovery'
@@ -145,11 +148,15 @@ ok 'spawn: exact argv, spaces, shell characters, title, worktree, trust diagnost
 
 out=$(hq sessions)
 contains "$out" 'alpha ('
-contains "$out" 'waiting/idle'
+contains "$out" $'idle1\twaiting\t'
+contains "$out" $'12345678\tidle\t'
+contains "$out" 'feedface'
+contains "$out" '1 older idle hidden, -a to show'
+[[ $out != *87654321* && $out != *null* && $out != *'?/idle'* ]] || fail 'interactive display / idle filtering'
 contains "$out" '(other)'
 [[ $out != *done1* ]] || fail 'completed session leaked without --all'
 out=$(hq sessions alpha -a --json)
-assert_json "$out" 'length==3 and all(.[];.project=="alpha") and any(.[];.id=="done1")' 'sessions filtering / --all'
+assert_json "$out" 'length==6 and all(.[];.project=="alpha") and any(.[];.id=="done1") and any(.[];.id=="87654321" and .state=="idle")' 'sessions filtering / --all'
 assert_json "$(tail -1 "$CALL_LOG")" '.args==["agents","--json","--all"]' 'built-in --all'
 if AGENTS_FAIL=1 hq sessions >/dev/null 2>&1; then fail 'failed agent listing accepted'; fi
 ok 'sessions: grouping, filter, status/state, age, completed sessions'
@@ -162,6 +169,8 @@ contains "$out" 'claude rm done1'
 contains "$out" 'worktree remove'
 contains "$out" 'branch -d'
 contains "$out" 'dirty entries'
+contains "$out" 'hq stop 87654321'
+[[ $out != *'claude rm 87654321'* ]] || fail 'interactive cleanup suggested background remove'
 [[ $(git -C "$HOME/dev/alpha" status --porcelain=v1) == "$before" ]] || fail 'cleanup modified repository'
 git -C "$HOME/dev/alpha" show-ref --verify --quiet refs/heads/merged-topic || fail 'cleanup deleted branch'
 [[ -d $HOME/dev/skip-worktrees/alpha-merged ]] || fail 'cleanup removed worktree'
@@ -182,6 +191,12 @@ contains "$(hq stop done1)" 'Removed done1'
 [[ $(wc -l <"$SIGNAL_LOG") -eq 2 ]] || fail 'completed session without pid was signalled'
 printf '[{"id":"bad","pid":0,"state":"working"}]\n' >"$fixture/bad-pid.json"
 if AGENTS_FILE="$fixture/bad-pid.json" hq stop bad >/dev/null 2>&1; then fail 'unsafe pid accepted'; fi
+out=$(hq stop 12345678)
+contains "$out" 'claude rm only applies to background ids'
+[[ $(wc -l <"$SIGNAL_LOG") -eq 4 && $(tail -1 "$SIGNAL_LOG") == '-INT 999995' ]] || fail 'interactive stop signals'
+assert_json "$(tail -1 "$CALL_LOG")" '.args==["agents","--json","--all"]' 'interactive stop must not remove'
+jq '[.[]|select(.sessionId=="12345678-recent")]|. + [.[0]+{sessionId:"12345678-collision"}]' "$AGENTS_FILE" >"$fixture/ambiguous-sessions.json"
+if AGENTS_FILE="$fixture/ambiguous-sessions.json" hq stop 12345678 >/dev/null 2>&1; then fail 'ambiguous session prefix accepted'; fi
 ok 'stop: SIGINT twice then built-in rm, unknown id rejected'
 
 out=$(hq health)
@@ -208,7 +223,9 @@ ok 'health: Beszel users auth, v0.21 fields, triggered alerts, pagination, failu
 
 out=$(DISK_PCT=90 FAILED_UNITS=1 hq brief)
 [[ $(awk 'END{print NR}' <<<"$out") -le 30 ]] || fail 'brief exceeds 30 lines'
-contains "$out" 'sessions alpha: 2 live'
+contains "$out" 'sessions alpha: 3 live'
+contains "$out" '1 older idle hidden, -a to show'
+contains "$(hq brief -a)" 'sessions alpha: 5 live'
 contains "$out" 'project alpha: 1 dirty, 1 ahead'
 contains "$out" 'Cleanup:'
 contains "$out" 'Next:'
@@ -218,8 +235,13 @@ out=$(ALERTS_FILE="$fixture/many-alerts.json" hq brief)
 [[ $(awk 'END{print NR}' <<<"$out") -le 30 ]] || fail 'busy brief exceeds 30 lines'
 contains "$out" 'next settled priority'
 hook=$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$repo/hooks/hooks.json")
-out=$(CLAUDE_PLUGIN_ROOT="$fixture/missing-plugin-cache" bash -c "$hook")
+out=$(CLAUDE_PROJECT_DIR="$repo" CLAUDE_PLUGIN_ROOT="$fixture/missing-plugin-cache" bash -c "$hook")
 contains "$out" 'next settled priority'
+calls_before=$(wc -l <"$CALL_LOG")
+out=$(CLAUDE_PROJECT_DIR="$HOME/dev/alpha" bash -c "$hook" 2>&1)
+[[ -z $out && $(wc -l <"$CALL_LOG") == "$calls_before" ]] || fail 'hook ran in child project'
+out=$(CLAUDE_PROJECT_DIR='' bash -c "$hook" 2>&1)
+[[ -z $out && $(wc -l <"$CALL_LOG") == "$calls_before" ]] || fail 'hook ran with no project root'
 ok 'brief: health, live sessions, dirty/ahead, cleanup count, memory Next, <=30 lines'
 export BESZEL_URL='' BESZEL_EMAIL='' BESZEL_PASSWORD=''
 

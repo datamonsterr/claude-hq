@@ -3,7 +3,7 @@
     "SessionStart": [
       {
         "hooks": [
-          {"type": "command", "command": "if command -v hq >/dev/null 2>&1; then hq brief; else \"${CLAUDE_PLUGIN_ROOT}/bin/hq\" brief; fi", "timeout": 60}
+          {"type": "command", "command": "[ -n \"${CLAUDE_PROJECT_DIR:-}\" ] && [ -f \"$CLAUDE_PROJECT_DIR/.hq-root\" ] || exit 0; if command -v hq >/dev/null 2>&1; then hq brief; else \"${CLAUDE_PLUGIN_ROOT}/bin/hq\" brief; fi", "timeout": 60}
         ]
       }
     ]
