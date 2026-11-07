@@ -1,71 +1,87 @@
-# claude-hq — spec v0.1
+# claude-hq — spec v0.2 (thin layer over built-ins)
 
 ## Problem
 
 The user works from a locked-down company laptop. Only the Claude Code app UI
-(claude.ai/code / desktop / mobile) is allowed; no SSH, no other remote tools.
-All real work runs on a home server (Arch Linux, this machine) via
-`claude remote-control`. The user wants ONE long-lived "HQ" session that:
+(claude.ai/code / desktop / mobile) is allowed; no SSH. All work runs on a home
+server via Remote Control. The user wants ONE long-lived "HQ" session that knows
+every project, spawns clickable working sessions, checks their state, flags
+cleanup and server health, and keeps a small durable memory across daily `/clear`.
 
-- knows every project on the server,
-- spawns new, clickable Remote Control sessions per project (not just `cd`),
-- lists and summarizes running sessions cheaply,
-- reports cleanup candidates, finished work, and server health (Beszel + local),
-- keeps a small durable memory, because the HQ session is cleared daily.
+## Principle: reuse built-ins, add only glue
 
-Prior art: Clauster (PyPI, schubydoo/clauster) does project-card spawning of
-remote-control bridges, but through a loopback web UI the laptop cannot reach.
-claude-hq does the same job from inside a Claude session.
+Verified on Claude Code 2.1.319 (2026-11-07):
+
+| Need | Built-in used | HQ adds |
+|---|---|---|
+| Spawn clickable session in a project | `cd <dir> && claude --bg --remote-control --name "<title>" [-w <name>] "<prompt>"` — verified: background session, Remote Control active, URL `claude.ai/code/session_…` | `hq spawn` resolves project name to dir, builds title, prints id |
+| List sessions + status | `claude agents --json` (id, cwd, kind, name, status, state, sessionId) | `hq sessions` groups by project, compact table |
+| Session summary | AI session name in `claude agents --json`; `/recap`; `claude -p --resume <id> "…"` (adds a turn); `ListAgents`/`SendMessage` cross-session messaging tools | nothing; skill tells HQ which to use and when |
+| Stop / remove | `claude stop <id>`, `claude rm <id>` | nothing |
+| Transcript/worktree cleanup | `cleanupPeriodDays`, worktree auto-removal, `claude purge` | `hq cleanup` *report only*: done/idle sessions > N h, merged-but-present worktrees/branches, dirty repos |
+| Disk cleanup | user's existing `machine-cleanup` skill | nothing |
+| Health + alerts | Beszel hub (already alerts, heartbeat) | `hq health`: compact Beszel summary via its PocketBase API; tiny local fallback (df, failed units) |
+| Memory | Built-in auto memory (MEMORY.md index + topic files, loaded at start, survives `/clear`) | layout + rules, stored in repo so it syncs via git (see Memory) |
+
+Dropped from v0.1: tmux, own session registry, own transcript parsing, own stop/kill, auto-delete.
 
 ## Shape
 
-A git repo that is both:
-1. the HQ project directory (open it in Claude Code, run `claude remote-control --name HQ` in it), and
-2. a Claude Code plugin + marketplace (`.claude-plugin/`), so others can install the skill/commands/hook.
-
 ```
 claude-hq/
-  .claude-plugin/plugin.json        plugin manifest (name: hq)
-  .claude-plugin/marketplace.json   marketplace listing this repo's plugin
-  CLAUDE.md                         HQ controller rules (short)
-  bin/hq                            single bash CLI, deps: bash, git, jq, tmux, claude, curl (Beszel only)
-  skills/hq/SKILL.md                when/how to use each hq subcommand
-  commands/*.md                     slash commands: brief, spawn, sessions, cleanup, health, remember
-  hooks/hooks.json                  SessionStart: run `hq brief` (compact)
-  memory/MEMORY.md                  durable notes, committed and pushed
-  systemd/claude-hq.service         user unit template: keeps the HQ bridge alive
-  install.sh                        symlink bin/hq into ~/.local/bin, copy config example
-  config.example.env                HQ_ROOTS, HQ_PERMISSION_MODE, BESZEL_* ...
-  tests/run.sh                      fixture-based tests, no network, no real claude
-  README.md
+  .claude-plugin/plugin.json, marketplace.json   plugin "hq"
+  CLAUDE.md                 HQ controller rules (<60 lines)
+  .claude/settings.json     HQ-dir settings (memory dir if allowed, permissions for hq/claude agents)
+  bin/hq                    bash; deps: bash, git, jq, curl, claude
+  skills/hq/SKILL.md        decision table: which built-in or hq command per intent
+  commands/brief.md, spawn.md, cleanup.md
+  hooks/hooks.json          SessionStart: `hq brief`
+  memory/                   durable memory (see Memory)
+  systemd/claude-hq.service user unit keeping `claude remote-control --name HQ` alive in the repo dir
+  install.sh, config.example.env, tests/run.sh, README.md
 ```
 
-## `hq` CLI
+## `hq` CLI (each output compact; `--json` where useful)
 
-Config: env vars, optionally loaded from `${XDG_CONFIG_HOME:-~/.config}/claude-hq/config.env`.
-State: `${XDG_STATE_HOME:-~/.local/state}/claude-hq/` (sessions.jsonl registry, logs).
-Every command prints compact, plain text (token budget matters). `--json` where noted.
+- `hq projects` — git repos directly under `HQ_ROOTS` (colon list, default `~/dev`), skipping `*-worktrees`. Row: name, branch, dirty count, ahead/behind, last commit age, live session count (from `claude agents --json` cwd prefix).
+- `hq spawn <project> [-n title] [-w [name]] [--mode <permission-mode>] [prompt…]` — runs the built-in command above in the project dir. Prints short id + title. Title default `"<project>: <first 6 words of prompt>"`.
+- `hq sessions [project]` — `claude agents --json` (add `--all` with `-a`) grouped by project root, columns id, state/status, age, name.
+- `hq stop <id>` — Clauster-proven sequence: SIGINT the session pid (from `claude agents --json`) twice, then `claude rm <id>` (plain `claude stop` reportedly SIGKILLs and can orphan the cloud session).
+- `hq cleanup [--idle-hours 12]` — report only, with exact commands to run (`claude stop/rm`, `git worktree remove`, `git branch -d`). Never deletes.
+- `hq health` — if `BESZEL_URL`, `BESZEL_EMAIL`, `BESZEL_PASSWORD` set: auth (`/api/collections/users/auth-with-password`), list systems (name, status, cpu/mem/disk %) and active alerts. Else/also: root+home disk %, `systemctl --failed` count. Warnings only by default, `-v` for all.
+- `hq brief` — <=30 lines: health warnings, live sessions per project, dirty/ahead projects, cleanup count, top of memory "Next".
 
-| Command | Behavior |
-|---|---|
-| `hq projects [--json]` | Git repos directly under each dir in `HQ_ROOTS` (colon-separated, default `~/dev`). Per repo: name, branch, dirty file count, ahead/behind upstream (if any), last commit age, number of extra worktrees. Skip `*-worktrees` dirs. |
-| `hq spawn <project> [-n name] [--worktree] [--mode <permission-mode>] [-p "first prompt"]` | Start a new Remote Control session in that project inside a detached tmux session `hq-<project>-<shortid>`. Session title `"<project> · <name>"`. `--worktree` creates `git worktree add` on branch `hq/<slug>` under `<root>/<project>-worktrees/<slug>` and runs there. Optional first prompt: verify how to pass one (positional prompt with `claude --remote-control`/`--name`, or fallback: write `.hq-brief.md` in the run dir and make the title say "read .hq-brief.md"). Record id, project, dir, tmux name, title, created_at in sessions.jsonl. Print the title so the user can find it in claude.ai/code. |
-| `hq sessions [--json]` | Registry rows joined with live state: tmux alive?, transcript last activity (newest `*.jsonl` mtime in `~/.claude/projects/<encoded dir>/`, encoding = path with `/` and `.` replaced by `-`), age. Also list non-hq transcript dirs active in last 24h as "other". |
-| `hq summary <id\|project> [-n N]` | Digest of newest transcript: last N (default 3) user prompts and last assistant text, each truncated to ~300 chars, plus tool-call count. Use jq; never print the whole file. |
-| `hq stop <id>` | Kill the tmux session, mark row stopped. |
-| `hq cleanup [--apply] [--idle-hours H]` | Report (default) or act: dead tmux rows (prune), bridges idle > H (default 12) hours (stop), worktrees whose branch is merged into default branch (remove worktree + branch), `git worktree prune`. Never touch dirty worktrees. Dry-run is default. |
-| `hq health [--json]` | Disk usage of `/` and `$HOME` (warn >85%), memory, load vs cores, `systemctl --failed` (system+user), docker containers not running/unhealthy. If `BESZEL_URL` + `BESZEL_EMAIL` + `BESZEL_PASSWORD` set: auth against Beszel's PocketBase API and list systems with status and triggered alerts (check Beszel 0.21 docs/source for exact endpoints). Missing tools degrade to a "skipped" line, never fail. |
-| `hq brief` | One screen (<=40 lines): health warnings only, live sessions, projects with dirty/ahead work, cleanup candidate count, "Next" section from memory. Used by SessionStart hook. |
-| `hq remember "<text>" [--section Next\|Decisions\|Notes]` | Append dated bullet to memory/MEMORY.md under the section. `hq memory` prints it. Memory path: `HQ_MEMORY` or `<repo>/memory/MEMORY.md`. |
+## Memory
+
+Decision (see docs/research-memory.md): use built-in auto memory as-is, copy the
+Anthropic memory-tool / structured-notes pattern. No claude-mem / agentmemory /
+basic-memory (daemon or MCP server each). Beads optional later for cross-project tasks.
+
+Layout (in repo, synced via git):
+- `memory/MEMORY.md` — index, one line per entry, cap 80 lines / ~6KB. Only file auto-loaded.
+- `memory/projects/<name>.md` — <=40 lines each: path, purpose, status, gotchas. Read on demand.
+- `memory/decisions.md` — append-only, one line per decision, dated.
+- `memory/log/YYYY-MM.md` — never loaded; grep only.
+
+Wiring: `install.sh` writes `.claude/settings.local.json` (gitignored) in the repo with
+`autoMemoryDirectory` = absolute path of `<repo>/memory` (relative paths rejected by Claude Code).
+
+Rules (in CLAUDE.md):
+- Save: decisions, user preferences, project mappings/status, recurring failures.
+  Never save what `git`, the repo, or `claude agents --json` can tell.
+- Write when a fact settles. End of day: move day notes to `log/YYYY-MM.md`, prune index, `git commit && git push`.
+- Spawned `--bg` children may lack auto memory: pass needed context in the spawn prompt;
+  ask children to end with a <=2k-token summary.
+
+`hq memory check` — warn when MEMORY.md > 80 lines or a project file > 40 lines.
 
 ## Acceptance
 
-- `bash -n bin/hq` and `shellcheck bin/hq install.sh tests/run.sh` clean (shellcheck if installed).
-- `tests/run.sh` passes: builds fixture HOME with 2 fake git repos (one dirty, one with merged worktree), fake transcript jsonl, stub `claude`/`tmux`/`systemctl`/`docker` on PATH; covers projects, spawn (asserts stub claude argv + registry row), sessions, summary, cleanup dry-run vs --apply, health without Beszel, brief line count <=40, remember.
-- `claude plugin validate .` (or equivalent per current docs) passes for the plugin manifest.
-- README: 5-minute setup for the home server, how to run HQ bridge under systemd/tmux, how the laptop uses it, install as plugin elsewhere.
-- No secrets, hostnames, IPs, or personal paths committed.
+- `bash -n bin/hq`; shellcheck clean if installed.
+- `tests/run.sh`: fixture HOME + stub `claude` (records argv, returns canned `agents --json`), stub `curl`/`systemctl`/`df`; no network, no real `~/.claude`. Covers projects, spawn argv, sessions grouping, cleanup report, health with and without Beszel, brief <=30 lines.
+- `claude plugin validate .` passes.
+- No secrets, hostnames, IPs, personal paths committed.
 
-## Out of scope (v0.1)
+## Out of scope
 
-Web UI, MCP server, multi-machine, auto-merging, sending messages into running sessions, cost tracking.
+Web UI, MCP server, multi-machine, auto-deletion, auto-merging, cost tracking.
