@@ -11,6 +11,9 @@ export CLAUDE_CONFIG_DIR=$HOME/.claude
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 export HQ_ROOTS=$HOME/dev:$HOME/other
 export BESZEL_URL='' BESZEL_EMAIL='' BESZEL_PASSWORD=''
+# Legacy report fixtures opt out; the dedicated default-policy case unsets this.
+export HQ_JANITOR_STOP_INTERACTIVE=0
+unset HQ_INTERACTIVE_HOURS
 export CALL_LOG=$fixture/claude-calls.jsonl CURL_LOG=$fixture/curl-calls.jsonl
 export AGENTS_FILE=$fixture/agents.json
 export SYSTEMS_FILE=$fixture/systems.json ALERTS_FILE=$fixture/alerts.json
@@ -112,6 +115,10 @@ STUB
 cat >"$fixture/stubs/timeout" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$TIMEOUT_LOG"
+if [[ ${TRACE_ANCESTORS:-0} == 1 && ! -f $HQ_PROC_ROOT/$$/status ]]; then
+  mkdir -p "$HQ_PROC_ROOT/$$"
+  printf 'PPid:\t%s\n' "$PPID" >"$HQ_PROC_ROOT/$$/status"
+fi
 if [[ ${FAIL_REPO_SCAN:-0} == 1 && " $* " == *' _scan-repo '* ]]; then exit 124; fi
 exec "$REAL_TIMEOUT" "$@"
 STUB
@@ -345,8 +352,8 @@ expect_refusal() {
   [[ $(awk 'END{print NR}' <<<"$output") == 1 ]] || fail 'spawn refusal must be one line'
   contains "$output" "$expected"
 }
-contains "$(hq capacity)" 'sessions 7/40 (3.5G rss, 2 idle>24h) · mem 16G avail · load 0.4/core · disk 20% · tmp 20%'
-expect_refusal 'sessions 7/7 (2 idle>24h); run hq janitor' env HQ_MAX_SESSIONS=7 "$repo/bin/hq" spawn alpha -- test
+contains "$(hq capacity)" 'sessions 7/40 (3.5G rss, 0 idle>72h) · mem 16G avail · load 0.4/core · disk 20% · tmp 20%'
+expect_refusal 'sessions 7/7 (0 idle>72h); run hq janitor' env HQ_MAX_SESSIONS=7 "$repo/bin/hq" spawn alpha -- test
 expect_refusal 'memory' env HQ_MIN_MEM_MB=20000 "$repo/bin/hq" spawn alpha -- test
 expect_refusal 'load' env HQ_MAX_LOAD=0.1 "$repo/bin/hq" spawn alpha -- test
 expect_refusal 'disk 90%' env DISK_PCT=90 "$repo/bin/hq" spawn alpha -- test
@@ -404,8 +411,8 @@ jq -n --arg root "$janitor_root/tools" --arg bucket "$bucket" --argjson now "$no
  {id:"busy-old",pid:999974,sessionId:"busy-old-session",kind:"background",state:"working",status:"busy",cwd:$root,startedAt:(($now-180000)*1000)},
  {id:"active-recent",pid:999973,sessionId:"active-recent-session",kind:"background",state:"waiting",status:"idle",cwd:$root,startedAt:(($now-180000)*1000)},
  {id:"idle-recent",pid:999972,sessionId:"idle-recent-session",kind:"background",state:"waiting",status:"idle",cwd:$root,startedAt:(($now-3600)*1000)},
- {pid:999971,sessionId:"interactive-old",kind:"interactive",status:"idle",cwd:$root,startedAt:(($now-180000)*1000)},
- {pid:999970,sessionId:"remote-old",kind:"remote",status:"idle",cwd:$root,startedAt:(($now-180000)*1000)},
+ {pid:999971,sessionId:"interactive-old",kind:"interactive",status:"idle",cwd:$root,startedAt:(($now-360000)*1000)},
+ {pid:999970,sessionId:"remote-old",kind:"remote",status:"idle",cwd:$root,startedAt:(($now-360000)*1000)},
  {id:"live-wt",pid:999969,sessionId:"session-live-temp",kind:"background",state:"working",status:"busy",cwd:($root+"/.claude/worktrees/live/subdir"),startedAt:($now*1000)}
 ]' >"$janitor_agents"
 # Contents deliberately are not a transcript; janitor must stat, never parse.
@@ -482,7 +489,7 @@ ok 'janitor apply: safe worktrees/branches, stale temp, negative cases, signals,
 jq '[.[]|select(.kind=="interactive" or .kind=="remote")]' "$janitor_agents" >"$fixture/interactive-agents.json"
 out=$(HQ_ROOTS="$janitor_root" AGENTS_FILE="$fixture/interactive-agents.json" HQ_JANITOR_STOP_INTERACTIVE=1 hq janitor --apply)
 contains "$out" 'stop idle interactive interactive-old'
-[[ $(rg -c -- '-INT 999971' "$SIGNAL_LOG") == 2 && $(rg -c -- '-INT 999970' "$SIGNAL_LOG") == 2 ]] || fail 'interactive opt-in stop missing'
+[[ $(rg -c -- '-INT 999971' "$SIGNAL_LOG") == 2 && $(rg -c -- '-INT 999970' "$SIGNAL_LOG") == 2 ]] || fail 'explicit interactive stop missing'
 # A held flock must suppress the entire janitor without querying agents.
 exec 8>"$XDG_STATE_HOME/claude-hq/janitor.lock"
 flock -n 8
@@ -496,7 +503,7 @@ printf 'must survive\n' >"$checkout/memory/session-stale/file"
 "$REAL_FIND" -P "$checkout/memory/session-stale" -exec touch -d '5 days ago' {} +
 HQ_ROOTS="$janitor_root" AGENTS_FILE="$fixture/interactive-agents.json" TMPDIR="$checkout/memory" "$checkout/bin/hq" janitor --apply >/dev/null
 [[ -f $checkout/memory/session-stale/file ]] || fail 'HQ memory touched'
-ok 'janitor: interactive opt-in, exclusive lock, HQ memory protected'
+ok 'janitor: interactive enable, exclusive lock, HQ memory protected'
 
 # A worktree bucket can be the only project entry under a configured root.
 linked_root=$HOME/linked-projects
@@ -524,6 +531,40 @@ env -u TMPDIR HQ_ROOTS="$HOME/missing" AGENTS_FILE="$fixture/no-agents.json" "$r
 [[ ! -e $HOME/.cache/tmp/claude-default-old && -f $HOME/.cache/outside-old ]] || fail 'default TMPDIR cleanup escaped its root'
 ok 'janitor: discover sibling worktree buckets through Git metadata'
 
+# Exercise the default without the opt-out used by the legacy report fixtures.
+mkdir -p "$fixture/guard-tmp" "$HQ_PROC_ROOT/812345"
+printf 'PPid:\t0\n' >"$HQ_PROC_ROOT/812345/status"
+ln -s "$repo" "$fixture/hq-alias"
+jq -n --arg hq "$repo" --arg alias "$fixture/hq-alias" --arg cwd "$HOME" --argjson now "$(date +%s)" '
+ [
+ {pid:900110,sessionId:"guard-busy",kind:"interactive",status:"busy",cwd:$cwd,startedAt:(($now-100*3600)*1000)},
+ {pid:900111,sessionId:"guard-hq",kind:"interactive",status:"idle",cwd:($hq+"/memory"),startedAt:(($now-100*3600)*1000)},
+ {pid:900112,sessionId:"guard-71h",kind:"interactive",status:"idle",cwd:$cwd,startedAt:(($now-71*3600)*1000)},
+ {pid:900113,sessionId:"guard-73h",kind:"interactive",status:"idle",cwd:$cwd,startedAt:(($now-73*3600)*1000)},
+ {pid:812345,sessionId:"guard-ancestor",kind:"remote",status:"idle",cwd:$cwd,startedAt:(($now-100*3600)*1000)},
+ {pid:900115,sessionId:"guard-hq-alias",kind:"interactive",status:"idle",cwd:($alias+"/memory"),startedAt:(($now-100*3600)*1000)},
+ {pid:900116,id:"guard-busy-done",sessionId:"guard-busy-done",kind:"background",state:"done",status:"busy",cwd:$cwd,startedAt:(($now-100*3600)*1000)}
+ ]' >"$fixture/guard-agents.json"
+signals_before=$(wc -l <"$SIGNAL_LOG")
+# Expand process ids/environment in the child that becomes the janitor parent.
+# shellcheck disable=SC2016
+out=$(env -u HQ_JANITOR_STOP_INTERACTIVE TRACE_ANCESTORS=1 HQ_ROOTS="$HOME/missing" AGENTS_FILE="$fixture/guard-agents.json" TMPDIR="$fixture/guard-tmp" bash -c '
+  mkdir -p "$HQ_PROC_ROOT/$$"
+  printf "PPid:\t812345\n" >"$HQ_PROC_ROOT/$$/status"
+  exec "$HQ_TEST_REPO_ROOT/bin/hq" janitor --apply
+')
+contains "$out" 'stop idle interactive >72h: 1'
+[[ $(( $(wc -l <"$SIGNAL_LOG")-signals_before )) == 2 ]] || fail 'protected or 71h session stopped'
+[[ $(tail -2 "$SIGNAL_LOG") == $'-INT 900113\n-INT 900113' ]] || fail '73h session did not receive SIGINT twice'
+[[ $(jq -s '[.[]|select(.args[0]=="rm" and (.args[1]|startswith("guard-")))]|length' "$CALL_LOG") == 0 ]] || fail 'interactive/busy session removed'
+signals_before=$(wc -l <"$SIGNAL_LOG")
+out=$(HQ_JANITOR_STOP_INTERACTIVE=0 HQ_ROOTS="$HOME/missing" AGENTS_FILE="$fixture/guard-agents.json" TMPDIR="$fixture/guard-tmp" hq janitor --apply)
+contains "$out" '(report-only; HQ_JANITOR_STOP_INTERACTIVE=0)'
+[[ $(wc -l <"$SIGNAL_LOG") == "$signals_before" ]] || fail 'interactive opt-out stopped a session'
+contains "$(HQ_INTERACTIVE_HOURS=24 hq capacity)" 'idle>24h)'
+contains "$(env -u HQ_JANITOR_STOP_INTERACTIVE "$repo/bin/hq" brief)" 'idle interactive >72h stops on --apply'
+ok 'interactive default: 73h stopped, 71h/busy/HQ/alias/ancestor kept, opt-out report-only'
+
 stress_root=$HOME/stress-projects
 mkdir -p "$stress_root"
 for ((i=0;i<20;i++)); do init_repo "$stress_root/p$i"; done
@@ -541,7 +582,7 @@ for ((project=0;project<150;project++)); do
   done
 done
 "$REAL_FIND" -P "$CLAUDE_CONFIG_DIR/projects" -mindepth 2 -maxdepth 2 -type f \
-  -path "$CLAUDE_CONFIG_DIR/projects/perf-*/*.jsonl" -exec touch -d '40 hours ago' {} +
+  -path "$CLAUDE_CONFIG_DIR/projects/perf-*/*.jsonl" -exec touch -d '96 hours ago' {} +
 jq -n --arg root "$stress_root" --argjson now "$(date +%s)" '[range(0;40)|{id:("stress-"+tostring),sessionId:("stress-session-"+tostring),pid:(900000+.),kind:"background",state:"working",status:"busy",cwd:($root+"/p"+(.%20|tostring)),startedAt:($now*1000)}]' >"$fixture/stress-agents.json"
 for action in brief janitor; do
   calls_before=$(jq -s '[.[]|select(.args[0]=="agents")]|length' "$CALL_LOG")
@@ -564,12 +605,12 @@ ok 'performance: one agent query/index, brief <1.5s, janitor <2s, brief <=30 lin
 
 jq -n --arg root "$stress_root" --argjson now "$(date +%s)" '
  [range(0;2)|{id:("busy-"+tostring),sessionId:("busy-session-"+tostring),pid:(900000+.),kind:"background",state:"working",status:"busy",cwd:($root+"/p0"),startedAt:($now*1000)}] +
- [range(0;54)|{sessionId:("stress-idle-"+tostring),pid:(900002+.),kind:"interactive",status:"idle",cwd:($root+"/p0"),startedAt:(($now-48*3600)*1000)}]' >"$fixture/idle-agents.json"
+ [range(0;54)|{sessionId:("stress-idle-"+tostring),pid:(900002+.),kind:"interactive",status:"idle",cwd:($root+"/p0"),startedAt:(($now-96*3600)*1000)}]' >"$fixture/idle-agents.json"
 mkdir -p "$HQ_PROC_ROOT/900000" "$HQ_PROC_ROOT/900001"
 printf 'VmRSS:\t10485760 kB\n' >"$HQ_PROC_ROOT/900000/status"
 printf 'VmRSS:\t3250586 kB\n' >"$HQ_PROC_ROOT/900001/status"
-contains "$(HQ_ROOTS="$stress_root" AGENTS_FILE="$fixture/idle-agents.json" hq capacity)" 'sessions 56/40 (13.1G rss, 54 idle>24h)'
-expect_refusal '54 idle>24h); run hq janitor' env HQ_ROOTS="$stress_root" AGENTS_FILE="$fixture/idle-agents.json" "$repo/bin/hq" spawn p0 -- test
+contains "$(HQ_ROOTS="$stress_root" AGENTS_FILE="$fixture/idle-agents.json" hq capacity)" 'sessions 56/40 (13.1G rss, 54 idle>72h)'
+expect_refusal '54 idle>72h); run hq janitor' env HQ_ROOTS="$stress_root" AGENTS_FILE="$fixture/idle-agents.json" "$repo/bin/hq" spawn p0 -- test
 for action in brief janitor; do
   started_ns=$(date +%s%N)
   out=$(HQ_ROOTS="$stress_root" AGENTS_FILE="$fixture/idle-agents.json" hq "$action")
@@ -579,7 +620,7 @@ for action in brief janitor; do
   if [[ $action == brief ]]; then [[ $(awk 'END{print NR}' <<<"$out") -le 30 ]] || fail 'idle-heavy brief exceeds 30 lines'; fi
   printf 'timing: %s %sms (56 sessions, 54 older idle, 150x20 transcripts)\n' "$action" "$elapsed_ms"
 done
-contains "$out" 'stop idle interactive >24h: 54 (report-only; HQ_JANITOR_STOP_INTERACTIVE=1)'
+contains "$out" 'stop idle interactive >72h: 54 (report-only; HQ_JANITOR_STOP_INTERACTIVE=0)'
 contains "$out" 'delete merged branches: 132'
 [[ $(awk '/^  report: idle interactive / {n++} END{print n+0}' <<<"$out") == 3 ]] || fail 'interactive report exceeded three samples'
 [[ $(awk '/^  plan: delete merged branch / {n++} END{print n+0}' <<<"$out") == 3 ]] || fail 'branch report exceeded three samples'

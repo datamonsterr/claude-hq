@@ -24,12 +24,42 @@ janitor_action() {
   fi
 }
 
+load_janitor_ancestors() {
+  local pid=$PPID parent key value rest depth
+  declare -gA JANITOR_ANCESTORS=()
+  JANITOR_ANCESTORS[$$]=1
+  for ((depth=0;depth<128;depth++)); do
+    [[ $pid =~ ^[0-9]+$ && $pid -gt 0 && ! ${JANITOR_ANCESTORS[$pid]+yes} ]] || break
+    JANITOR_ANCESTORS[$pid]=1
+    parent=0
+    if [[ -r ${HQ_PROC_ROOT:-/proc}/$pid/status ]]; then
+      while read -r key value rest; do
+        if [[ $key == PPid: ]]; then parent=$value; break; fi
+      done <"${HQ_PROC_ROOT:-/proc}/$pid/status"
+    fi
+    pid=$parent
+  done
+}
+
+janitor_protected_session() {
+  local pid=$1 cwd=$2 canonical
+  [[ ! ${JANITOR_ANCESTORS[$pid]+yes} ]] || return 0
+  [[ $cwd != "$HQ_DIR" && $cwd != "$HQ_DIR/"* ]] || return 0
+  if [[ -d $cwd ]]; then
+    canonical=$(cd -P -- "$cwd" && pwd) || return 0
+    [[ $canonical != "$HQ_DIR" && $canonical != "$HQ_DIR/"* ]] || return 0
+  fi
+  return 1
+}
+
 janitor_signal() {
   local pid=$1
   [[ $pid =~ ^[0-9]+$ && $pid -gt 1 && $pid -ne $$ && $pid -ne $PPID ]] || return 1
+  [[ ! ${JANITOR_ANCESTORS[$pid]+yes} ]] || return 1
   kill -INT "$pid" 2>/dev/null || true
   external sleep 0.2
   kill -INT "$pid" 2>/dev/null || true
+  external sleep 0.2
 }
 
 janitor_remove_session() {
@@ -78,6 +108,11 @@ session_work_safe() {
 janitor_sessions() {
   local id sid kind state status pid cwd activity age display
   while IFS=$'\t' read -r id sid kind state status pid cwd activity; do
+    [[ $status != busy ]] || continue
+    if janitor_protected_session "$pid" "$cwd"; then
+      report_item guarded 'keep HQ/ancestor sessions' "$sid"
+      continue
+    fi
     (( activity > 0 )) || continue
     age=$((NOW-activity))
     if [[ $kind == background && $state == 'done' && $id != '-' ]] && (( age > DONE_SECONDS )); then
@@ -88,10 +123,10 @@ janitor_sessions() {
       display=$id; [[ $display != '-' ]] || display=$sid
       janitor_action "stop idle background $display (conversation kept)" janitor_signal "$pid" || true
     elif [[ $kind != background && $status == idle ]] && (( age > INTERACTIVE_SECONDS && pid > 1 )); then
-      if [[ ${HQ_JANITOR_STOP_INTERACTIVE:-0} == 1 ]]; then
+      if [[ ${HQ_JANITOR_STOP_INTERACTIVE:-1} == 1 ]]; then
         janitor_action "stop idle interactive $sid (conversation kept)" janitor_signal "$pid" || true
-      else report_item interactive "stop idle interactive >${HQ_INTERACTIVE_HOURS:-24}h" \
-        "report: idle interactive $sid" ' (report-only; HQ_JANITOR_STOP_INTERACTIVE=1)'; fi
+      else report_item interactive "stop idle interactive >${HQ_INTERACTIVE_HOURS:-72}h" \
+        "report: idle interactive $sid" ' (report-only; HQ_JANITOR_STOP_INTERACTIVE=0)'; fi
     fi
   done < <(jq -r '.[]|[(.id // "-"),(.sessionId // "-"),(.kind // "unknown"),(.state // "-"),
     (.status // "unknown"),(.pid // 0),(.cwd // ""),.lastActivity]|@tsv' <<<"$ALL_AGENTS")
@@ -262,8 +297,9 @@ janitor() {
   exec 9>"$state_dir/janitor.lock"
   if ! external flock -n 9; then printf 'janitor: another run holds the lock\n'; return 0; fi
   JANITOR_LOG=$state_dir/janitor.log
+  load_janitor_ancestors
   settings=$(jq -nr --arg 'done' "${HQ_DONE_HOURS:-2}" --arg idle "${HQ_IDLE_HOURS:-12}" \
-    --arg interactive "${HQ_INTERACTIVE_HOURS:-24}" --arg worktree "${HQ_WORKTREE_HOURS:-1}" \
+    --arg interactive "${HQ_INTERACTIVE_HOURS:-72}" --arg worktree "${HQ_WORKTREE_HOURS:-1}" \
     --arg tmp "${HQ_TMP_DAYS:-3}" --arg systemTmp "${HQ_SYSTEM_TMP_DAYS:-2}" '
     [$done,$idle,$interactive,$worktree,$tmp,$systemTmp]|map(tonumber)|
     if any(.[]; .<0) then error("janitor ages must be nonnegative") else

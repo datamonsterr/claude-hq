@@ -399,6 +399,11 @@ brief() {
   # Render fully, then cap without SIGPIPE or losing errors in producers.
   data=$(
     capacity_line
+    if [[ ${HQ_JANITOR_STOP_INTERACTIVE:-1} == 1 ]]; then
+      printf 'Janitor: idle interactive >%sh stops on --apply; HQ/busy/ancestors kept\n' "${HQ_INTERACTIVE_HOURS:-72}"
+    else
+      printf 'Janitor: idle interactive >%sh report-only (HQ_JANITOR_STOP_INTERACTIVE=0)\n' "${HQ_INTERACTIVE_HOURS:-72}"
+    fi
     printf 'HQ brief\n'
     health_data false | jq -r '.[0:6][]|.message'
     discover

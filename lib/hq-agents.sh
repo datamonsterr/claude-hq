@@ -39,8 +39,8 @@ collect_process_memory() {
         fi
       done <"$file"
     } 2>/dev/null || true
-  done < <(jq -r --argjson now "$NOW" '[.[]|
+  done < <(jq -r --argjson now "$NOW" --arg hours "${HQ_INTERACTIVE_HOURS:-72}" '[.[]|
     select(.state!="done" and .state!="completed" and .state!="stopped" and .pid!=null)] as $live |
-    "count\t\($live|length)","idle\t\([$live[]|select(.status=="idle" and .lastActivity>0 and ($now-.lastActivity)>=86400)]|length)",
+    "count\t\($live|length)","idle\t\([$live[]|select(.status=="idle" and .lastActivity>0 and ($now-.lastActivity)>(($hours|tonumber)*3600))]|length)",
     ([$live[].pid|select(type=="number")]|unique[]|"pid\t\(.)")' <<<"$ALL_AGENTS")
 }

@@ -39,14 +39,14 @@ collect_capacity() {
     elif [[ $DISK_TYPE == tmpfs ]] && (( DISK_USE > tmp )); then tmp=$DISK_USE; fi
   done
   CAPACITY_JSON=$(jq -cn --argjson sessions "$LIVE_SESSION_COUNT" --argjson idle "$OLD_IDLE_COUNT" \
-    --argjson rss "$CLAUDE_RSS_KB" --arg max "${HQ_MAX_SESSIONS:-40}" \
+    --argjson rss "$CLAUDE_RSS_KB" --arg idleHours "${HQ_INTERACTIVE_HOURS:-72}" --arg max "${HQ_MAX_SESSIONS:-40}" \
     --argjson mem "$mem" --arg min "${HQ_MIN_MEM_MB:-3072}" --arg load "$load" --argjson cores "$cores" \
     --arg maxLoad "${HQ_MAX_LOAD:-1.5}" --argjson disk "$disk" --argjson tmp "$tmp" --argjson unknown "$unknown" '
     ($max|tonumber) as $max | ($min|tonumber) as $min | ($maxLoad|tonumber) as $maxLoad |
     (try ($load|tonumber) catch -1) as $load |
     (if $cores>0 then $load/$cores else -1 end) as $perCore |
-    {sessions:$sessions,maxSessions:$max,idleOver24h:$idle,rssKB:$rss,memoryMB:$mem,loadPerCore:$perCore,disk:$disk,tmp:$tmp,
-      reasons:([if $sessions >= $max then "sessions \($sessions)/\($max) (\($idle) idle>24h); run hq janitor to review cleanup" else empty end,
+    {sessions:$sessions,maxSessions:$max,idleOverThreshold:$idle,idleHours:($idleHours|tonumber),rssKB:$rss,memoryMB:$mem,loadPerCore:$perCore,disk:$disk,tmp:$tmp,
+      reasons:([if $sessions >= $max then "sessions \($sessions)/\($max) (\($idle) idle>\($idleHours)h); run hq janitor to review cleanup" else empty end,
         if $mem<0 then "memory availability unknown" elif $mem<$min then "memory \($mem)MB available, minimum \($min)MB" else empty end,
         if $perCore<0 then "load unavailable" elif $perCore>$maxLoad then "load \($perCore)/core exceeds \($maxLoad)" else empty end,
         if $unknown or $disk<0 then "disk usage unavailable" elif $disk>=90 then "disk \($disk)% (limit <90%)" else empty end,
@@ -54,5 +54,5 @@ collect_capacity() {
 }
 
 capacity_line() {
-  jq -r '"sessions \(.sessions)/\(.maxSessions) (\((.rssKB/1048576*10|round)/10)G rss, \(.idleOver24h) idle>24h) · mem \(if .memoryMB<0 then "?" else ((.memoryMB/1024|floor)|tostring)+"G" end) avail · load \(if .loadPerCore<0 then "?" else ((.loadPerCore*100|round)/100|tostring) end)/core · disk \(.disk)% · tmp \(.tmp)%"' <<<"$CAPACITY_JSON"
+  jq -r '"sessions \(.sessions)/\(.maxSessions) (\((.rssKB/1048576*10|round)/10)G rss, \(.idleOverThreshold) idle>\(.idleHours)h) · mem \(if .memoryMB<0 then "?" else ((.memoryMB/1024|floor)|tostring)+"G" end) avail · load \(if .loadPerCore<0 then "?" else ((.loadPerCore*100|round)/100|tostring) end)/core · disk \(.disk)% · tmp \(.tmp)%"' <<<"$CAPACITY_JSON"
 }

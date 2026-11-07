@@ -136,7 +136,8 @@ Spawn requires fewer than `HQ_MAX_SESSIONS=40` live Claude processes, at least
 disk use <90%, and tmpfs `/tmp`/`$TMPDIR` use <80%. Refusal exits 3 with a one-line
 reason; `--force` explicitly bypasses admission. `hq capacity` is also the first
 line of `hq brief`.
-For example: `sessions 56/40 (13.1G rss, 54 idle>24h)`. All live processes count,
+For example: `sessions 56/40 (13.1G rss, 54 idle>72h)`. The idle label follows
+`HQ_INTERACTIVE_HOURS` (default 72). All live processes count,
 including older idle sessions. RSS sums accessible live-pid VmRSS metadata;
 exited processes are skipped. A session-count refusal includes the older idle
 count and points to `hq janitor`.
@@ -146,7 +147,9 @@ the policy in [SPEC: Capacity and auto-clean](docs/SPEC.md#capacity-and-auto-cle
 
 - Done backgrounds inactive >2h: SIGINT twice, then built-in rm if work is safe.
 - Other non-busy backgrounds inactive >12h: stop only; keep the conversation.
-- Interactive/remote idle >24h: report only unless `HQ_JANITOR_STOP_INTERACTIVE=1`.
+- Interactive/remote idle >72h: stop by default; `HQ_JANITOR_STOP_INTERACTIVE=0`
+  opts out to report-only. SIGINT twice with short waits keeps the conversation;
+  interactive sessions are never removed with claude rm.
 - Clean, merged, non-live worktrees untouched >1h: remove with Git, then prune;
   delete merged branches only with an approved prefix (`hq/ so/ claude/ worktree-`).
 - Stale Claude scratch/session directories in `$TMPDIR` (default `~/.cache/tmp`)
@@ -157,7 +160,10 @@ Age uses one depth-two transcript mtime index and a sessionId join, without
 reading contents or running per-session globs/stat processes. Duplicate ids use
 the newest mtime, with session start time as fallback. Idle conversations are retained; idle alone
 does not establish completed work. Dirty/unmerged work, symlink targets, live
-worktrees, and HQ memory are protected. Configure the `HQ_*` thresholds listed
+worktrees, and HQ memory are protected. Busy sessions, sessions inside the HQ
+checkout (also through symlinks), and the janitor's own ancestor processes are
+never stopped. The brief states the current stop/report-only policy; hiding old
+interactive rows in session displays still uses 24h. Configure the `HQ_*` thresholds listed
 in [config.example.env](config.example.env). Each external janitor call has a
 timeout, scans use four workers with a five-second repository budget, and each
 invocation queries Claude's agents only once. Janitor runs at low CPU/I/O priority,

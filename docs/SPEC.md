@@ -66,10 +66,11 @@ report-only. No session registry, transcript content parsing, or replacement for
 Claude's session/worktree operations is introduced.
 
 `hq capacity` prints one line, for example:
-`sessions 56/40 (13.1G rss, 54 idle>24h) · mem 14G avail · load 0.4/core · disk 43% · tmp 16%`.
+`sessions 56/40 (13.1G rss, 54 idle>72h) · mem 14G avail · load 0.4/core · disk 43% · tmp 16%`.
 Sessions counts non-done/non-stopped rows with a pid, including interactive rows.
 RSS sums VmRSS from `/proc/<pid>/status` for unique live pids, ignoring exited or
-inaccessible pids. Idle>24h uses the joined last-activity timestamp and status idle;
+inaccessible pids. Idle>Nh uses HQ_INTERACTIVE_HOURS (default 72), the joined
+last-activity timestamp, and status idle;
 these idle processes still count towards admission. A session-limit refusal names
 the idle count and points to `hq janitor` for review.
 Disk and tmp show the maximum relevant percentage across the checked paths.
@@ -115,8 +116,15 @@ Janitor policy:
    preserving its resumable conversation; idle is not proof of completion.
 2. Other background sessions that are not busy/running/working and inactive >
    `HQ_IDLE_HOURS` (12) receive SIGINT twice only; no rm.
-3. Interactive/remote idle sessions inactive > `HQ_INTERACTIVE_HOURS` (24) are
-   reported only, unless `HQ_JANITOR_STOP_INTERACTIVE=1`; that opt-in stops only.
+3. Interactive/remote idle sessions inactive > `HQ_INTERACTIVE_HOURS` (72) are
+   stopped by default (`HQ_JANITOR_STOP_INTERACTIVE=1`). Stop means SIGINT twice
+   with short waits, preserving the conversation; never claude rm for interactive
+   sessions. `HQ_JANITOR_STOP_INTERACTIVE=0` makes these findings report-only.
+   Never stop a busy session, a session whose cwd is inside the HQ checkout
+   (including paths through symlinks), or the janitor/any of its ancestor processes.
+   Read the ancestor PPid chain once from proc status metadata and guard again
+   before signaling. Capacity's idle label and brief's janitor hint use the same
+   configured threshold. The 24h display-hiding rule remains separate.
 4. Registered worktrees are discovered through Git for every repository under
    HQ_ROOTS, including sibling `<repo>-worktrees/*` and `.claude/worktrees/*`.
    Remove only non-primary worktrees with no modified, untracked, or ignored

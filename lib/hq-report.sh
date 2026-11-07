@@ -35,7 +35,7 @@ report_action() {
   case $summary in
     'remove done session '*) rule='done'; label="remove done background sessions >${HQ_DONE_HOURS:-2}h" ;;
     'stop idle background '*) rule=background; label="stop idle background >${HQ_IDLE_HOURS:-12}h (conversation kept)" ;;
-    'stop idle interactive '*) rule=interactive; label="stop idle interactive >${HQ_INTERACTIVE_HOURS:-24}h" ;;
+    'stop idle interactive '*) rule=interactive; label="stop idle interactive >${HQ_INTERACTIVE_HOURS:-72}h" ;;
     'remove merged worktree '*) rule=worktrees; label='remove merged worktrees' ;;
     'prune worktrees '*) rule=prune; label='prune worktree metadata' ;;
     'delete merged branch '*) rule=branches; label='delete merged branches' ;;
