@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# Thin glue over Claude Code's session, worktree, and memory facilities.
+set -euo pipefail
+
+die() { printf 'hq: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
+need jq
+need git
+
+# Resolve the installed symlink so memory always belongs to this checkout.
+source_path=${BASH_SOURCE[0]}
+while [[ -L $source_path ]]; do
+  source_dir=$(cd -P -- "$(dirname -- "$source_path")" && pwd)
+  source_path=$(readlink -- "$source_path")
+  [[ $source_path = /* ]] || source_path=$source_dir/$source_path
+done
+HQ_DIR=$(cd -P -- "$(dirname -- "$source_path")/.." && pwd)
+config=${XDG_CONFIG_HOME:-$HOME/.config}/claude-hq/config.env
+if [[ -f $config ]]; then
+  # User-owned shell configuration; never search project .env files.
+  # shellcheck disable=SC1090
+  source "$config"
+fi
+HQ_ROOTS=${HQ_ROOTS:-$HOME/dev}
+MEMORY_DIR=$HQ_DIR/memory
+NOW=$(date +%s)
+AGENTS='[]'
+PROJECTS='[]'
+REPOS=()
+
+usage() {
+  cat <<'EOF'
+Usage: hq projects [--json]
+       hq spawn <project> [-n title] [-w [name]] [--mode mode] [--] [prompt…]
+       hq sessions [project] [-a|--all] [--json]
+       hq stop <id>
+       hq cleanup [--idle-hours N] [--json]
+       hq health [-v] [--json]
+       hq brief
+       hq memory check
+Projects are repositories directly under HQ_ROOTS (colon-separated; default ~/dev).
+Use -- after a bare -w to separate the prompt from an optional worktree name.
+EOF
+}
+
+load_agents() {
+  need claude
+  local args=(agents --json)
+  [[ ${1:-} != all ]] || args+=(--all)
+  AGENTS=$(claude "${args[@]}") || die 'claude agents failed'
+  jq -e 'type == "array" and all(.[]; type == "object")' <<<"$AGENTS" >/dev/null \
+    || die 'claude agents returned invalid JSON'
+}
+
+discover() {
+  local root dir top
+  local -a roots
+  local -A seen=()
+  IFS=: read -r -a roots <<<"$HQ_ROOTS"
+  shopt -s nullglob dotglob
+  REPOS=()
+  for root in "${roots[@]}"; do
+    [[ $root != \~/* ]] || root=$HOME/${root:2}
+    [[ -d $root ]] || continue
+    for dir in "$root"/*; do
+      [[ -d $dir && ${dir##*/} != *-worktrees ]] || continue
+      dir=$(cd -- "$dir" && pwd -P)
+      [[ -e $dir/.git ]] || continue
+      top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue
+      [[ $top = "$dir" && ! ${seen[$dir]+yes} ]] || continue
+      seen[$dir]=1
+      REPOS+=("$dir")
+    done
+  done
+}
+
+project_paths() {
+  local dir
+  for dir in "${REPOS[@]}"; do
+    jq -cn --arg name "${dir##*/}" --arg path "$dir" '{name:$name,path:$path}'
+  done | jq -s 'sort_by(.name,.path)'
+}
+
+resolve_project() {
+  local matches
+  matches=$(project_paths | jq --arg name "$1" '[.[] | select(.name == $name or .path == $name)]')
+  case $(jq length <<<"$matches") in
+    0) die "unknown project: $1 (see hq projects)" ;;
+    1) jq -r '.[0].path' <<<"$matches" ;;
+    *) die "ambiguous project: $1; use its absolute path" ;;
+  esac
+}
+
+collect_projects() {
+  local dir branch dirty ahead behind counts stamp age
+  PROJECTS=$(
+    for dir in "${REPOS[@]}"; do
+      branch=$(git -C "$dir" symbolic-ref --short -q HEAD || git -C "$dir" rev-parse --short HEAD 2>/dev/null || printf '(unborn)')
+      dirty=$(git -C "$dir" status --porcelain=v1 | wc -l)
+      ahead=0; behind=0
+      if counts=$(git -C "$dir" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null); then
+        read -r ahead behind <<<"$counts"
+      fi
+      age=null
+      if stamp=$(git -C "$dir" log -1 --format=%ct 2>/dev/null) && [[ -n $stamp ]]; then
+        age=$(( NOW > stamp ? NOW - stamp : 0 ))
+      fi
+      jq -cn --arg name "${dir##*/}" --arg path "$dir" --arg branch "$branch" \
+        --argjson dirty "$dirty" --argjson ahead "$ahead" --argjson behind "$behind" \
+        --argjson age "$age" --argjson agents "$AGENTS" '
+        {name:$name,path:$path,branch:$branch,dirty:$dirty,ahead:$ahead,behind:$behind,
+         lastCommitAgeSeconds:$age,liveSessions:([$agents[] |
+           select(.state != "done" and .state != "completed" and .state != "stopped") |
+           select(.cwd == $path or ((.cwd // "") | startswith($path+"/")))] | length)}'
+    done | jq -s 'sort_by(.name,.path)'
+  )
+}
+
+projects() {
+  local json=false
+  case ${1:-} in --json) json=true; shift ;; esac
+  (( $# == 0 )) || die 'usage: hq projects [--json]'
+  discover; load_agents; collect_projects
+  if $json; then printf '%s\n' "$PROJECTS"; return; fi
+  printf 'PROJECT\tBRANCH\tDIRTY\tAHEAD/BEHIND\tCOMMIT AGE\tLIVE\n'
+  jq -r '.[] | [.name,.branch,.dirty,"\(.ahead)/\(.behind)",
+    (if .lastCommitAgeSeconds == null then "—" else "\((.lastCommitAgeSeconds/3600|floor))h" end),.liveSessions] | @tsv' <<<"$PROJECTS"
+}
+
+spawn() {
+  (( $# > 0 )) || die 'usage: hq spawn <project> [-n title] [-w [name]] [--mode mode] [prompt…]'
+  local project=$1 title='' worktree=false worktree_name='' mode='' prompt dir output rc=0 id
+  shift
+  while (( $# )); do
+    case $1 in
+      -n|--name) (( $# >= 2 )) || die 'missing title'; title=$2; shift 2 ;;
+      -w|--worktree)
+        worktree=true; shift
+        if (( $# )) && [[ $1 != -* ]]; then worktree_name=$1; shift; fi ;;
+      --mode) (( $# >= 2 )) || die 'missing permission mode'; mode=$2; shift 2 ;;
+      --) shift; break ;;
+      -*) die "unknown spawn option: $1" ;;
+      *) break ;;
+    esac
+  done
+  prompt=$*
+  discover; dir=$(resolve_project "$project")
+  if [[ -z $title ]]; then
+    title=$(jq -rn --arg prompt "$prompt" '$prompt | [scan("\\S+")][0:6] | join(" ")')
+    title="${dir##*/}: ${title:-work}"
+  fi
+  local args=(--bg --remote-control "$title" --name "$title")
+  if $worktree; then
+    args+=(-w)
+    [[ -z $worktree_name ]] || args+=("$worktree_name")
+  fi
+  [[ -z $mode ]] || args+=(--permission-mode "$mode")
+  args+=(-- "$prompt")
+  need claude
+  output=$(cd -- "$dir" && claude "${args[@]}" 2>&1) || rc=$?
+  # Preserve diagnostics, including the workspace-trust message and clickable URL.
+  printf '%s\n' "$output"
+  (( rc == 0 )) || return "$rc"
+  id=$(sed -nE 's/.*backgrounded[[:space:]]*·[[:space:]]*([[:alnum:]_-]+).*/\1/p' <<<"$output" | head -1)
+  [[ -n $id ]] || die 'no background session id returned; review Claude output above'
+  printf '%s · %s\n' "$id" "$title"
+}
+
+session_data() {
+  local paths
+  paths=$(project_paths)
+  jq --argjson projects "$paths" --argjson now "$NOW" '
+    map(. as $s | ($projects | map(. as $p | select($s.cwd == $p.path or
+      (($s.cwd // "") | startswith($p.path+"/")))) | sort_by(.path|length) | last) as $p |
+      . + {project:($p.name // "(other)"),projectPath:($p.path // ""),
+           ageSeconds:([0,($now - ((.startedAt // ($now*1000))/1000|floor))]|max)}) |
+    sort_by(.project,.projectPath,.startedAt)' <<<"$AGENTS"
+}
+
+sessions() {
+  local all='' json=false project='' dir='' data
+  while (( $# )); do
+    case $1 in
+      -a|--all) all=all ;;
+      --json) json=true ;;
+      -*) die "unknown sessions option: $1" ;;
+      *) [[ -z $project ]] || die 'only one project filter is allowed'; project=$1 ;;
+    esac
+    shift
+  done
+  discover
+  [[ -z $project ]] || dir=$(resolve_project "$project")
+  load_agents "$all"; data=$(session_data)
+  if [[ -n $dir ]]; then data=$(jq --arg dir "$dir" '[.[]|select(.projectPath == $dir)]' <<<"$data"); fi
+  if $json; then printf '%s\n' "$data"; return; fi
+  jq -r 'group_by(.projectPath)[] | "\(.[0].project)\(if .[0].projectPath == "" then "" else " (\(.[0].projectPath))" end)",
+    (.[] | "  \(.id)\t\(.state // "?")/\(.status // "?")\t\((.ageSeconds/3600|floor))h\t\((.name // "(unnamed)")|gsub("[\\r\\n\\t]";" "))")' <<<"$data"
+  [[ $(jq length <<<"$data") != 0 ]] || printf 'No sessions.\n'
+}
+
+stop_session() {
+  (( $# == 1 )) || die 'usage: hq stop <id>'
+  local record pid
+  load_agents all
+  record=$(jq --arg id "$1" '[.[]|select(.id == $id)]' <<<"$AGENTS")
+  [[ $(jq length <<<"$record") == 1 ]] || die "session id not found or not unique: $1"
+  pid=$(jq -r '.[0].pid // empty' <<<"$record")
+  if [[ -n $pid ]]; then
+    [[ $pid =~ ^[0-9]+$ && $pid -gt 1 && $pid -ne $$ && $pid -ne $PPID ]] || die 'invalid session pid'
+    kill -INT "$pid" 2>/dev/null || true
+    # Let the first interrupt be handled before sending the second.
+    sleep 0.2
+    kill -INT "$pid" 2>/dev/null || true
+  elif ! jq -e '.[0].state == "done" or .[0].state == "completed" or .[0].state == "stopped"' <<<"$record" >/dev/null; then
+    die 'live session has no pid; refusing to remove it'
+  fi
+  claude rm "$1"
+}
+
+cleanup_item() {
+  local kind=$1 project=$2 summary=$3
+  shift 3
+  { if (( $# )); then printf '%s\0' "$@"; fi; } | jq -Rsc --arg kind "$kind" --arg project "$project" --arg summary "$summary" \
+    '{kind:$kind,project:$project,summary:$summary,commands:(split("\u0000")[:-1])}'
+}
+
+cleanup_data() {
+  local hours=$1 dir base branch current field wt='' wtcommit='' dirty command_remove command_branch id state age
+  {
+    while IFS=$'\t' read -r id state age; do
+      [[ -n $id ]] || continue
+      printf -v command_remove 'claude rm %q' "$id"
+      printf -v command_branch 'claude stop %q' "$id"
+      cleanup_item session '' "$id $state; session age ${age}h (idle duration unavailable)" "$command_branch" "$command_remove"
+    done < <(jq -r --argjson now "$NOW" --argjson hours "$hours" '.[] |
+      select(.state == "done" or .state == "completed" or .status == "idle") |
+      select((.startedAt|type) == "number" and ($now - .startedAt/1000) > ($hours*3600)) |
+      [.id,(.state // .status),((($now-.startedAt/1000)/3600)|floor)]|@tsv' <<<"$AGENTS")
+    for dir in "${REPOS[@]}"; do
+      current=$(git -C "$dir" symbolic-ref --short -q HEAD || true)
+      base=$(git -C "$dir" symbolic-ref -q refs/remotes/origin/HEAD || true)
+      if [[ -z $base ]]; then
+        for branch in main master "$current"; do
+          if [[ -n $branch ]] && git -C "$dir" rev-parse --verify "$branch^{commit}" >/dev/null 2>&1; then base=$branch; break; fi
+        done
+      fi
+      wt=''; wtcommit=''
+      while IFS= read -r -d '' field; do
+        case $field in
+          'worktree '*) wt=${field#worktree } ;;
+          'HEAD '*) wtcommit=${field#HEAD } ;;
+          '')
+            if [[ -n $wt && -d $wt ]]; then
+              dirty=$(git -C "$wt" status --porcelain=v1 | wc -l)
+              if (( dirty > 0 )); then cleanup_item dirty "${dir##*/}" "$wt: $dirty dirty entries"; fi
+              if [[ $wt != "$dir" && -n $base && -n $wtcommit ]] && \
+                  git -C "$dir" merge-base --is-ancestor "$wtcommit" "$base" 2>/dev/null; then
+                printf -v command_remove 'git -C %q worktree remove -- %q' "$dir" "$wt"
+                if (( dirty == 0 )); then
+                  cleanup_item worktree "${dir##*/}" "$wt merged into $base" "$command_remove"
+                else
+                  cleanup_item worktree "${dir##*/}" "$wt merged into $base; preserve dirty work before removal"
+                fi
+              fi
+            fi
+            wt=''; wtcommit='' ;;
+        esac
+      done < <(git -C "$dir" worktree list --porcelain -z)
+      [[ -n $base ]] || continue
+      while IFS= read -r branch; do
+        [[ -n $branch && $branch != "$current" && $branch != "$base" && $branch != main && $branch != master ]] || continue
+        printf -v command_branch 'git -C %q branch -d -- %q' "$dir" "$branch"
+        cleanup_item branch "${dir##*/}" "$branch merged into $base (remove its worktree first if checked out)" "$command_branch"
+      done < <(git -C "$dir" for-each-ref --merged="$base" --format='%(refname:short)' refs/heads/)
+    done
+  } | jq -s '.'
+}
+
+cleanup() {
+  local hours=12 json=false data
+  while (( $# )); do
+    case $1 in
+      --idle-hours) (( $# >= 2 )) || die 'missing idle hours'; hours=$2; shift ;;
+      --json) json=true ;;
+      *) die "unknown cleanup option: $1" ;;
+    esac
+    shift
+  done
+  [[ $hours =~ ^[0-9]+([.][0-9]+)?$ ]] || die 'idle hours must be a nonnegative number'
+  discover; load_agents all; data=$(cleanup_data "$hours")
+  if $json; then printf '%s\n' "$data"; return; fi
+  printf 'Cleanup report only · %s findings · idle candidates use session age\n' "$(jq length <<<"$data")"
+  jq -r '.[] | "\(.kind): \(.summary)",(.commands[] | "  " + .)' <<<"$data"
+}
+
+# PocketBase pages, authenticated only in memory. Do not persist credentials/tokens.
+beszel_records() {
+  local collection=$1 token=$2 page=1 result items='[]' pages
+  while :; do
+    result=$(curl --silent --show-error --fail --connect-timeout 3 --max-time 8 \
+      --get "$BESZEL_URL/api/collections/$collection/records" \
+      -H "Authorization: $token" --data-urlencode "page=$page" --data-urlencode 'perPage=200' \
+      --data-urlencode 'expand=system' --data-urlencode "filter=$([[ $collection != alerts ]] || printf 'triggered=true')" 2>/dev/null) || return 1
+    jq -e '.items|type == "array"' <<<"$result" >/dev/null || return 1
+    items=$(jq -cn --argjson previous "$items" --argjson result "$result" '$previous+$result.items')
+    pages=$(jq -r '.totalPages // 1' <<<"$result")
+    [[ $pages =~ ^[0-9]+$ ]] || return 1
+    (( page < pages )) || break
+    page=$((page+1))
+  done
+  printf '%s\n' "$items"
+}
+
+health_data() {
+  local verbose=$1 label target line pct units count auth token systems alerts
+  {
+    for label in root home; do
+      target=/; [[ $label != home ]] || target=$HOME
+      if line=$(df -P -- "$target" 2>/dev/null); then
+        pct=$(awk 'NR==2 {gsub(/%/,"",$5);print $5}' <<<"$line")
+        if [[ $pct =~ ^[0-9]+$ ]]; then
+          if $verbose || (( pct >= 85 )); then
+            jq -cn --arg label "$label" --argjson value "$pct" \
+              '{kind:"disk",warning:($value>=85),message:("disk "+$label+": "+($value|tostring)+"%")}'
+          fi
+        else cleanup_health_warning "disk $label: unavailable"; fi
+      else cleanup_health_warning "disk $label: unavailable"; fi
+    done
+    if command -v systemctl >/dev/null && units=$(systemctl --failed --no-legend --plain --no-pager 2>/dev/null); then
+      count=$(awk 'NF {n++} END {print n+0}' <<<"$units")
+      if $verbose || (( count > 0 )); then
+        jq -cn --argjson count "$count" '{kind:"systemd",warning:($count>0),message:("failed units: "+($count|tostring))}'
+      fi
+    else cleanup_health_warning 'failed units: unavailable'; fi
+    if [[ -n ${BESZEL_URL:-}${BESZEL_EMAIL:-}${BESZEL_PASSWORD:-} ]]; then
+      if [[ -z ${BESZEL_URL:-} || -z ${BESZEL_EMAIL:-} || -z ${BESZEL_PASSWORD:-} ]]; then
+        cleanup_health_warning 'Beszel: set URL, email and password together'
+      else
+        need curl
+        BESZEL_URL=${BESZEL_URL%/}
+        if auth=$(jq -cn --arg identity "$BESZEL_EMAIL" --arg password "$BESZEL_PASSWORD" \
+            '{identity:$identity,password:$password}' | \
+            curl --silent --show-error --fail --connect-timeout 3 --max-time 8 \
+              "$BESZEL_URL/api/collections/users/auth-with-password" \
+              -H 'Content-Type: application/json' --data-binary @- 2>/dev/null) && \
+            token=$(jq -er '.token|select(type == "string" and length>0)' <<<"$auth") && \
+            systems=$(beszel_records systems "$token") && alerts=$(beszel_records alerts "$token"); then
+          jq -c --argjson verbose "$verbose" '.[] |
+            {kind:"system",name:.name,status:.status,cpu:.info.cpu,memory:.info.mp,disk:.info.dp,
+             warning:(.status != "up" or (.info.cpu // 0)>=90 or (.info.mp // 0)>=85 or (.info.dp // 0)>=85),
+             message:("Beszel "+.name+": "+.status+" cpu \(.info.cpu // "?")% mem \(.info.mp // "?")% disk \(.info.dp // "?")%")}
+            | select($verbose or .warning)' <<<"$systems"
+          jq -c --argjson systems "$systems" '.[]|select(.triggered == true)|. as $a |
+            {kind:"alert",warning:true,system:.system,name:.name,value:.value,
+             message:("alert "+(.expand.system.name // ([$systems[]|select(.id==$a.system)|.name][0]) // .system)+": "+.name+" (threshold \(.value))")}' <<<"$alerts"
+        else cleanup_health_warning 'Beszel: unavailable (authentication or API request failed)'; fi
+      fi
+    fi
+  } | jq -s '.'
+}
+
+cleanup_health_warning() { jq -cn --arg message "$1" '{kind:"unavailable",warning:true,message:$message}'; }
+
+health() {
+  local verbose=false json=false data
+  while (( $# )); do
+    case $1 in -v|--verbose) verbose=true ;; --json) json=true ;; *) die "unknown health option: $1" ;; esac
+    shift
+  done
+  data=$(health_data "$verbose")
+  if $json; then printf '%s\n' "$data"; else jq -r '.[]|.message' <<<"$data"; fi
+}
+
+memory_check() {
+  local file lines warnings=0 cap
+  for file in "$MEMORY_DIR/MEMORY.md" "$MEMORY_DIR"/projects/*.md; do
+    [[ -f $file ]] || continue
+    cap=40; [[ $file != "$MEMORY_DIR/MEMORY.md" ]] || cap=80
+    lines=$(awk 'END {print NR}' "$file")
+    if (( lines > cap )); then printf 'memory warning: %s has %s lines (cap %s)\n' "${file#"$MEMORY_DIR/"}" "$lines" "$cap"; warnings=$((warnings+1)); fi
+  done
+  (( warnings > 0 )) || printf 'Memory within line limits.\n'
+}
+
+brief() {
+  (( $# == 0 )) || die 'usage: hq brief'
+  local data cleanup_count
+  # Render fully, then cap without SIGPIPE or losing errors in producers.
+  data=$(
+    printf 'HQ brief\n'
+    health_data false | jq -r '.[0:6][]|.message'
+    discover
+    if load_agents; then
+      session_data | jq -r '[.[]|select(.state != "done" and .state != "completed" and .state != "stopped")] |
+        group_by(.projectPath)[:6][] | "sessions \(.[0].project): \(length) live"'
+      collect_projects
+      jq -r '[.[]|select(.dirty>0 or .ahead>0)][:6][] | "project \(.name): \(.dirty) dirty, \(.ahead) ahead"' <<<"$PROJECTS"
+      if load_agents all; then
+        cleanup_count=$(cleanup_data 12 | jq length)
+        printf 'Cleanup: %s findings (hq cleanup)\n' "$cleanup_count"
+      fi
+    fi
+    printf 'Next:\n'
+    if [[ -f $MEMORY_DIR/MEMORY.md ]]; then
+      awk '/^## Next[[:space:]]*$/ {inside=1;next} inside && /^## / {exit} inside && NF {print; n++; if(n==5)exit}' "$MEMORY_DIR/MEMORY.md"
+    fi
+  )
+  head -30 <<<"$data"
+}
+
+command=${1:-help}
+(( $# == 0 )) || shift
+case $command in
+  projects) projects "$@" ;;
+  spawn) spawn "$@" ;;
+  sessions) sessions "$@" ;;
+  stop) stop_session "$@" ;;
+  cleanup) cleanup "$@" ;;
+  health) health "$@" ;;
+  brief) brief "$@" ;;
+  memory) [[ ${1:-} = check && $# == 1 ]] || die 'usage: hq memory check'; memory_check ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; die "unknown command: $command" ;;
+esac

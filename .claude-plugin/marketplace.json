@@ -1,0 +1,8 @@
+{
+  "name": "claude-hq",
+  "description": "A thin HQ controller for Claude Code on a home server.",
+  "owner": {"name": "claude-hq contributors"},
+  "plugins": [
+    {"name": "hq", "source": "./", "description": "HQ controller using Claude Code built-ins"}
+  ]
+}

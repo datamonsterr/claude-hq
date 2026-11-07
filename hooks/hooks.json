@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {"type": "command", "command": "if command -v hq >/dev/null 2>&1; then hq brief; else \"${CLAUDE_PLUGIN_ROOT}/bin/hq\" brief; fi", "timeout": 60}
+        ]
+      }
+    ]
+  }
+}
