@@ -272,31 +272,18 @@ janitor_temp() {
   fi
 }
 
-janitor() {
-  local apply=false verbose=false state_dir settings key
-  local -a args=(janitor)
-  while (( $# )); do
-    case $1 in --apply) apply=true ;; -v|--verbose) verbose=true ;; *) die 'usage: hq janitor [--apply] [-v]' ;; esac
-    shift
-  done
-  for key in flock nice ionice stat find; do need "$key"; done
-  if [[ ${HQ_JANITOR_CONTEXT:-0} != 1 ]]; then
-    if $apply; then args+=(--apply); fi
-    if $verbose; then args+=(-v); fi
-    exec timeout --kill-after=5 "${HQ_JANITOR_TIMEOUT:-120}" nice -n 19 ionice -c3 \
-      env HQ_JANITOR_CONTEXT=1 "$HQ_DIR/bin/hq" "${args[@]}"
-  fi
-  JANITOR_APPLY=$apply
-  # Consumed by the shared report renderer.
-  # shellcheck disable=SC2034
-  REPORT_VERBOSE=$verbose
-  report_init
+janitor_state() {
+  local state_dir
   state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/claude-hq
   [[ ! -L $state_dir && ! -L $state_dir/janitor.lock ]] || die 'refusing symlinked janitor state'
   external mkdir -p -- "$state_dir"
   exec 9>"$state_dir/janitor.lock"
-  if ! external flock -n 9; then printf 'janitor: another run holds the lock\n'; return 0; fi
+  external flock -n 9 || return 1
   JANITOR_LOG=$state_dir/janitor.log
+}
+
+janitor_load() {
+  local settings key
   load_janitor_ancestors
   settings=$(jq -nr --arg 'done' "${HQ_DONE_HOURS:-2}" --arg idle "${HQ_IDLE_HOURS:-12}" \
     --arg interactive "${HQ_INTERACTIVE_HOURS:-72}" --arg worktree "${HQ_WORKTREE_HOURS:-1}" \
@@ -308,10 +295,38 @@ janitor() {
   WORKTREE_CUTOFF=$((NOW-key))
   load_agents all
   load_activity_index
-  discover; scan_repos
   mapfile -t LIVE_CWDS < <(jq -r '.[]|select(.state!="done" and .state!="completed" and .state!="stopped")|.cwd // empty' <<<"$ALL_AGENTS")
+  # Any process cwd (codex, opencode, agy, shells, builds) also pins a worktree.
+  mapfile -t -O "${#LIVE_CWDS[@]}" LIVE_CWDS < <(external find "${HQ_PROC_ROOT:-/proc}" -maxdepth 2 -mindepth 2 -name cwd -printf '%l\n' 2>/dev/null | external sort -u)
+  discover; scan_repos
   mapfile -t LIVE_IDS < <(jq -r '.[]|select(.state!="done" and .state!="completed" and .state!="stopped")|(.sessionId // empty),(.id // empty)' <<<"$ALL_AGENTS")
   WORKTREE_ROWS=$(jq -r '.[]|. as $p|.worktrees[]|[.path,.dirty,.merged,(.path==$p.path)]|@tsv' <<<"$REPO_DATA")
+}
+
+janitor() {
+  local apply=false verbose=false status=0 key
+  local -a args=(janitor)
+  while (( $# )); do
+    case $1 in --apply) apply=true ;; -v|--verbose) verbose=true ;; *) die 'usage: hq janitor [--apply] [-v]' ;; esac
+    shift
+  done
+  for key in flock nice ionice stat find; do need "$key"; done
+  if [[ ${HQ_JANITOR_CONTEXT:-0} != 1 ]]; then
+    if $apply; then args+=(--apply); fi
+    if $verbose; then args+=(-v); fi
+    timeout --kill-after=5 "${HQ_JANITOR_TIMEOUT:-120}" nice -n 19 ionice -c3 \
+      env HQ_JANITOR_CONTEXT=1 "$HQ_DIR/bin/hq" "${args[@]}" || status=$?
+    # Build caches and worktrees left by any agent type; gated, own lock and timeout.
+    if $apply; then "$HQ_DIR/bin/hq" gc "${args[@]:1}" || true; fi
+    exit "$status"
+  fi
+  JANITOR_APPLY=$apply
+  # Consumed by the shared report renderer.
+  # shellcheck disable=SC2034
+  REPORT_VERBOSE=$verbose
+  report_init
+  if ! janitor_state; then printf 'janitor: another run holds the lock\n'; return 0; fi
+  janitor_load
   printf 'Janitor %s' "$(if $apply; then printf apply; else printf dry-run; fi)"
   if ! $verbose; then printf ' · up to 3 samples/rule; -v for all'; fi
   printf '\n'

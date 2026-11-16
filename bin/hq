@@ -4,7 +4,7 @@ set -euo pipefail
 
 HQ_ACTION=${1:-help}
 external() {
-  if [[ $HQ_ACTION == janitor || ${HQ_JANITOR_CONTEXT:-0} == 1 ]]; then
+  if [[ $HQ_ACTION == janitor || $HQ_ACTION == gc || ${HQ_JANITOR_CONTEXT:-0} == 1 ]]; then
     command timeout --kill-after=1 "${HQ_CALL_TIMEOUT:-8}" "$@"
   else
     command "$@"
@@ -53,6 +53,7 @@ Usage: hq projects [--json]
        hq health [-v] [--json]
        hq capacity
        hq janitor [--apply] [-v]
+       hq gc [--apply] [--force] [-v]
        hq brief [-a|--all]
        hq memory check
 Projects are repositories directly under HQ_ROOTS (colon-separated; default ~/dev).
@@ -443,6 +444,8 @@ source "$HQ_DIR/lib/hq-report.sh"
 source "$HQ_DIR/lib/hq-capacity.sh"
 # shellcheck source=lib/hq-janitor.sh
 source "$HQ_DIR/lib/hq-janitor.sh"
+# shellcheck source=lib/hq-gc.sh
+source "$HQ_DIR/lib/hq-gc.sh"
 
 command=${1:-help}
 (( $# == 0 )) || shift
@@ -455,6 +458,7 @@ case $command in
   health) health "$@" ;;
   capacity) (( $# == 0 )) || die 'usage: hq capacity'; load_agents; collect_capacity; capacity_line ;;
   janitor) janitor "$@" ;;
+  gc) gc "$@" ;;
   _scan-repo) repo_row "$@" ;;
   brief) brief "$@" ;;
   memory) [[ ${1:-} = check && $# == 1 ]] || die 'usage: hq memory check'; memory_check ;;

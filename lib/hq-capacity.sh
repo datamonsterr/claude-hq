@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 disk_sample() {
   local path=$1 output line
-  DISK_USE=-1; DISK_TYPE=unknown
+  DISK_USE=-1; DISK_TYPE=unknown; DISK_USED_KB=0
   if output=$(external df -PT -- "$path" 2>/dev/null); then
     while IFS= read -r line; do
       local -a fields
       read -r -a fields <<<"$line"
       if [[ ${fields[5]:-} =~ ^[0-9]+%$ ]]; then
-        DISK_USE=${fields[5]%\%}; DISK_TYPE=${fields[1]}
+        DISK_USE=${fields[5]%\%}; DISK_TYPE=${fields[1]}; DISK_USED_KB=${fields[3]}
       fi
     done <<<"$output"
   fi

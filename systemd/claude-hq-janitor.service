@@ -1,5 +1,5 @@
 [Unit]
-Description=Claude HQ bounded session and worktree janitor
+Description=Claude HQ bounded session, worktree and build-cache janitor
 
 [Service]
 Type=oneshot
@@ -10,5 +10,6 @@ Nice=19
 IOSchedulingClass=idle
 CPUWeight=10
 MemoryMax=256M
-TimeoutStartSec=130
+# Janitor (120s) then gated gc (HQ_GC_TIMEOUT, 900s).
+TimeoutStartSec=1050
 TimeoutStopSec=10

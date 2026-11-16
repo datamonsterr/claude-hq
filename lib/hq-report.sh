@@ -41,6 +41,10 @@ report_action() {
     'delete merged branch '*) rule=branches; label='delete merged branches' ;;
     'remove stale Claude temp '*) rule=scratch; label='remove stale Claude temp directories' ;;
     'remove old tmpfs file '*) rule=tmpfs; label='remove old tmpfs files' ;;
+    'clear go build cache '*) rule=gocache; label='clear Go build cache' ;;
+    'remove stale build target '*) rule=targets; label="remove build targets idle >${HQ_GC_IDLE_MINUTES:-60}m" ;;
+    'remove stale go temp '*) rule=gotmp; label="remove Go temp dirs idle >${HQ_GC_IDLE_MINUTES:-60}m" ;;
+    'docker '*) rule=docker; label='docker prune (build cache, dangling images; never volumes)' ;;
     *) rule=other; label='other actions' ;;
   esac
   report_item "$rule" "$label" "$detail" '' true

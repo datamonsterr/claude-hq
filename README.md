@@ -97,6 +97,7 @@ Cleanup is a report followed by a user decision.
 | `hq health [-v] [--json]` | Warnings, or all local and Beszel checks with `-v` |
 | `hq capacity` | Session count, Claude RSS, older idle count, available memory, load/core, disk and tmpfs use |
 | `hq janitor [--apply] [-v]` | Grouped plans/results with up to three samples; -v lists all; apply logs full details |
+| `hq gc [--apply] [--force] [-v]` | Disk-pressure build-cache and merged-worktree cleanup; see [Build and disk GC](#build-and-disk-gc) |
 | `hq brief [-a]` | At most 30 lines of health, live sessions, dirty/ahead projects, cleanup count, memory Next |
 | `hq memory check` | Warn about an index over 80 lines or project notes over 40 |
 
@@ -183,7 +184,54 @@ The timer runs every 15 minutes; the service sets Nice=19,
 IOSchedulingClass=idle, CPUWeight=10 and MemoryMax=256M. `install.sh` prints these
 enable commands and does not enable the timer. Also consider setting
 `"cleanupPeriodDays": 14` in `~/.claude/settings.json` yourself; the installer
-only prints this suggestion and never edits user Claude settings.
+only prints this suggestion. Its only edit to user Claude settings is the
+SessionEnd gc hook below.
+
+## Build and disk GC
+
+Agent builds refill caches quickly (Go build cache, per-epic Cargo target dirs,
+Go temp dirs, Docker build cache). `hq gc` prints a dry-run plan; `hq gc --apply`
+deletes. Both exit at once unless root disk use is at least `HQ_GC_DISK_PCT`
+(default 70) or `~/.cache/go-build` exceeds `HQ_GC_GO_GB` (default 10); `--force`
+skips this gate only.
+
+| Target | Rule |
+|---|---|
+| `$XDG_CACHE_HOME/go-build` (default `~/.cache`) | Removed whole; Go rebuilds it |
+| `$XDG_CACHE_HOME/*-target` | Removed when nothing inside changed for `HQ_GC_IDLE_MINUTES` (60) |
+| `$XDG_CACHE_HOME/tmp/go-build*` | Same idle rule |
+| Docker | `docker builder prune -f`, `docker image prune -f` (dangling only; never volumes) |
+| Worktrees in HQ_ROOTS projects | The janitor's rule: clean, merged into the default branch, unlocked, idle `HQ_WORKTREE_HOURS`, and not the cwd of any process |
+
+Build caches are skipped entirely while any `cargo`, `rustc`, `go build|test|run|install|vet|generate`,
+or `docker [compose|buildx] build` process of the user runs. Symlinks are never
+followed and nothing outside the cache directory is deleted. Worktree cleanup is
+skipped while the janitor holds its lock. Runs take `gc.lock` (no overlap), run at
+Nice 19 / idle I/O under `HQ_GC_TIMEOUT` (900 s), log to `janitor.log`, and report
+freed space from root-disk usage before and after.
+
+Triggers:
+
+- **Timer (all agents):** `hq janitor --apply` runs `hq gc --apply` after the
+  janitor, so the 15-minute timer covers Claude, Codex, OpenCode and agy runs,
+  including those superorchestrator starts. The service allows 1050 s.
+- **Claude Code SessionEnd:** `install.sh` merges this hook into
+  `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` beside existing SessionEnd hooks
+  (rerunning replaces it, never duplicates):
+  ```json
+  {"type": "command", "command": "setsid -f ~/.local/bin/hq gc --apply >/dev/null 2>&1 </dev/null", "timeout": 1}
+  ```
+  (`install.sh` writes the absolute path.) SessionEnd hooks share a 1.5 s budget and
+  cannot block exit; `setsid -f` returns immediately with stdio redirected, so the
+  exit never waits and gc outlives the session (also under `claude -p`).
+  Superorchestrator's Claude account uses `~/.claude`, so its runs get the hook too.
+- **Codex:** supports a `SessionEnd` hook (1 s default, 3 s max) in each
+  `$CODEX_HOME/hooks.json`, but every non-managed hook must be trusted per home via
+  `/hooks` before it runs. It is not installed automatically; to opt in, add the same
+  `command` with `"timeout": 1` under `hooks.SessionEnd[].hooks` in each Codex home
+  and trust it. The timer covers Codex otherwise.
+- **OpenCode, agy, superorchestrator:** no post-session command hook
+  (superorchestrator only sends Discord/desktop notifications), so the timer covers them.
 
 Health always checks root/home disk usage and failed system units when available.
 Default warnings: disk/memory >=85%, CPU >=90%, a non-up Beszel system, or a
@@ -243,7 +291,7 @@ claude plugin validate .
 ```
 
 Tests use a temporary HOME, Git repositories, and stubbed `claude`, `curl`,
-`systemctl`, `df`, and signals. They never start a real session, contact the
+`systemctl`, `df`, `docker`, `pgrep`, and signals. They never start a real session, contact the
 network, or touch real Claude configuration. Plugin validation checks metadata
 and packaging without starting a session. Performance coverage includes 150
 project directories x 20 transcripts, 20 repositories, and 132 branches;

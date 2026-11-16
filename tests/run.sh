@@ -6,6 +6,7 @@ trap 'rm -rf -- "$fixture"' EXIT
 export HOME=$fixture/home
 export XDG_CONFIG_HOME=$HOME/.config
 export XDG_STATE_HOME=$HOME/.local/state
+export XDG_CACHE_HOME=$HOME/.cache
 export TMPDIR=$fixture/tmp
 export CLAUDE_CONFIG_DIR=$HOME/.claude
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
@@ -127,6 +128,20 @@ cat >"$fixture/stubs/systemctl" <<'STUB'
 [[ ${SYSTEMCTL_FAIL:-0} != 1 ]] || exit 1
 if [[ ${FAILED_UNITS:-0} == 1 ]]; then printf 'fixture.service loaded failed failed Fixture\n'; fi
 exit 0
+STUB
+export DOCKER_LOG=$fixture/docker-calls
+: >"$DOCKER_LOG"
+cat >"$fixture/stubs/pgrep" <<'STUB'
+#!/usr/bin/env bash
+[[ -n ${BUILD_PROCS:-} ]] || exit 1
+printf '%s\n' "$BUILD_PROCS"
+STUB
+cat >"$fixture/stubs/docker" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$DOCKER_LOG"
+[[ ${DOCKER_DOWN:-0} != 1 ]] || exit 1
+[[ $1 != info ]] || exit 0
+printf 'Total reclaimed space: 0B\n'
 STUB
 cat >"$fixture/stubs/hq" <<'STUB'
 #!/usr/bin/env bash
@@ -315,16 +330,25 @@ cp -R "$repo/lib" "$checkout/"
 cp "$repo/install.sh" "$repo/config.example.env" "$checkout/"
 cp "$repo/memory/MEMORY.md" "$checkout/memory/"
 printf '{"permissions":{"allow":["Bash(git status)"]},"extra":"keep"}\n' >"$checkout/.claude/settings.local.json"
+mkdir -p "$CLAUDE_CONFIG_DIR"
+printf '%s\n' '{"model":"keep","hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"tkm-hook","args":["--event","session_end"],"timeout":1}]}],"Stop":[{"hooks":[{"type":"command","command":"keep-stop"}]}]}}' >"$CLAUDE_CONFIG_DIR/settings.json"
 install_output=$(bash "$checkout/install.sh")
 contains "$install_output" 'systemctl --user enable --now claude-hq-janitor.timer'
 contains "$install_output" '"cleanupPeriodDays": 14'
-[[ ! -e $HOME/.claude/settings.json ]] || fail 'installer edited user Claude settings'
+contains "$install_output" 'SessionEnd hook runs hq gc --apply'
+gc_hook_check='.model=="keep" and .hooks.Stop[0].hooks[0].command=="keep-stop"
+  and ([.hooks.SessionEnd[].hooks[]|select(.command=="tkm-hook")]|length==1)
+  and ([.hooks.SessionEnd[].hooks[]|select(.command|test("^setsid -f .*/\\.local/bin/hq gc --apply >/dev/null 2>&1 </dev/null$"))|select(.timeout==1)]|length==1)'
+jq -e "$gc_hook_check" "$CLAUDE_CONFIG_DIR/settings.json" >/dev/null || fail 'installer did not merge SessionEnd gc hook beside tkm-hook'
 [[ -f $XDG_CONFIG_HOME/claude-hq/config.env ]] || fail 'installer did not seed config'
 jq -e --arg memory "$checkout/memory" '.autoMemoryDirectory==$memory and .extra=="keep" and .permissions.allow==["Bash(git status)"]' "$checkout/.claude/settings.local.json" >/dev/null || fail 'installer did not merge settings'
 [[ -L $HOME/.local/bin/hq && $(readlink "$HOME/.local/bin/hq") == "$checkout/bin/hq" ]] || fail 'installer symlink'
 printf '# keep custom configuration\n' >"$XDG_CONFIG_HOME/claude-hq/config.env"
 bash "$checkout/install.sh" >/dev/null
 [[ $(cat "$XDG_CONFIG_HOME/claude-hq/config.env") == '# keep custom configuration' ]] || fail 'installer overwrote config'
+jq -e "$gc_hook_check" "$CLAUDE_CONFIG_DIR/settings.json" >/dev/null || fail 'installer duplicated or dropped SessionEnd hooks on rerun'
+# Only the installer may write user Claude settings; later guards expect none.
+rm -rf -- "$CLAUDE_CONFIG_DIR"
 out=$("$HOME/.local/bin/hq" memory check)
 contains "$out" 'within line limits'
 for ((i=0;i<81;i++)); do printf 'index entry\n'; done >"$checkout/memory/MEMORY.md"
@@ -643,8 +667,98 @@ out=$(HQ_ROOTS="$HOME/missing" AGENTS_FILE="$fixture/idle-agents.json" TMPDIR="$
 contains "$(cat "$XDG_STATE_HOME/claude-hq/janitor.log")" 'report: idle interactive stress-idle-53'
 ok 'reports: 54 idle + 132 branches grouped with <=3 samples, -v/JSON full, RSS and refusal guidance'
 
+# gc: build caches and worktrees under fixture HOME only; docker and pgrep are stubs.
+cache=$XDG_CACHE_HOME
+[[ $cache == "$fixture"/* ]] || fail "gc tests need a fixture cache, got $cache"
+gc_root=$HOME/gc-projects
+gc_reset() {
+  rm -rf -- "$cache" "$fixture/outside"
+  mkdir -p "$cache/go-build/00" "$cache/old-target/debug" "$cache/fresh-target" "$cache/tmp/go-build111/b001" \
+    "$cache/tmp/go-build222" "$cache/keep" "$fixture/outside/linked-target"
+  head -c 8192 /dev/zero >"$cache/go-build/00/entry-d"
+  printf 'x\n' | tee "$cache/old-target/debug/bin" "$cache/fresh-target/bin" "$cache/tmp/go-build111/b001/a" \
+    "$cache/tmp/go-build222/a" "$cache/keep/file" "$fixture/outside/linked-target/file" >/dev/null
+  ln -s "$fixture/outside/linked-target" "$cache/linked-target"
+  "$REAL_FIND" -P "$cache/old-target" "$cache/tmp/go-build111" "$fixture/outside" -exec touch -h -d '2 hours ago' {} +
+  : >"$DOCKER_LOG"
+}
+gc_untouched() {
+  [[ -f $cache/go-build/00/entry-d && -d $cache/old-target && -d $cache/tmp/go-build111 ]] || fail "$1"
+}
+gc_reset
+out=$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=50 hq gc --apply)
+contains "$out" 'GC skipped: disk 50% < 70%; go-build'
+gc_untouched 'gc below thresholds deleted caches'
+[[ ! -s $DOCKER_LOG ]] || fail 'gated gc called docker'
+out=$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=50 HQ_GC_GO_GB=0 hq gc)
+contains "$out" 'GC dry-run · go-build'
+contains "$out" "plan: clear go build cache $cache/go-build"
+contains "$out" "plan: remove stale build target $cache/old-target"
+contains "$out" "plan: remove stale go temp $cache/tmp/go-build111"
+contains "$out" 'plan: docker builder prune -f'
+contains "$out" 'plan: docker image prune -f (dangling only)'
+contains "$out" "keep build dirs used <60m: 2"
+[[ $out != *linked-target* && $out != *"$cache/keep"* ]] || fail 'gc planned a symlinked or non-cache dir'
+gc_untouched 'gc dry-run deleted caches'
+[[ $(cat "$DOCKER_LOG") == info ]] || fail 'gc dry-run pruned docker'
+: >"$DOCKER_LOG"
+out=$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=85 BUILD_PROCS='4242 cargo build --release' hq gc --apply)
+contains "$out" 'skip build caches: build running: 1'
+contains "$out" '4242 cargo build --release'
+gc_untouched 'gc deleted caches during a build'
+[[ ! -s $DOCKER_LOG ]] || fail 'gc touched docker during a build'
+out=$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=85 hq gc --apply)
+contains "$out" 'GC apply · disk 85% >= 70%'
+contains "$out" "applied: clear go build cache $cache/go-build"
+contains "$out" 'GC freed'
+[[ ! -e $cache/go-build && ! -e $cache/old-target && ! -e $cache/tmp/go-build111 ]] || fail 'gc kept stale caches'
+[[ -f $cache/fresh-target/bin && -f $cache/tmp/go-build222/a && -f $cache/keep/file ]] || fail 'gc removed recent or unrelated dirs'
+[[ -L $cache/linked-target && -f $fixture/outside/linked-target/file ]] || fail 'gc followed a symlinked target'
+[[ $(cat "$DOCKER_LOG") == $'info\nbuilder prune -f\nimage prune -f' ]] || fail "gc docker calls: $(cat "$DOCKER_LOG")"
+contains "$(cat "$XDG_STATE_HOME/claude-hq/janitor.log")" 'gc freed'
+contains "$(cat "$TIMEOUT_LOG")" '900 nice -n 19 ionice -c3 env HQ_JANITOR_CONTEXT=1'
+gc_reset
+DOCKER_DOWN=1 HQ_ROOTS="$gc_root" ROOT_DISK_PCT=85 hq gc --apply >/dev/null
+[[ $(cat "$DOCKER_LOG") == info ]] || fail 'gc pruned with docker unavailable'
+exec 7>"$XDG_STATE_HOME/claude-hq/gc.lock"
+flock -n 7
+gc_reset
+contains "$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=85 hq gc --apply)" 'gc: another run holds the lock'
+gc_untouched 'locked gc deleted caches'
+exec 7>&-
+ok 'gc: disk/go-build gate, dry-run, build guard, stale-only caches, symlinks, docker, lock, log'
+
+# gc worktrees: only clean + merged + unlocked + idle + not used by any process.
+init_repo "$gc_root/app"
+for name in clean locked busy dirty ahead; do git -C "$gc_root/app" worktree add -q -b "so/$name" "$gc_root/app-wt/$name"; done
+git -C "$gc_root/app" worktree lock "$gc_root/app-wt/locked"
+printf 'wip\n' >"$gc_root/app-wt/dirty/wip"
+git -C "$gc_root/app-wt/ahead" -c user.name=Fixture -c user.email=fixture.invalid commit -q --allow-empty -m ahead
+mkdir -p "$HQ_PROC_ROOT/777777"
+ln -s "$gc_root/app-wt/busy" "$HQ_PROC_ROOT/777777/cwd"
+"$REAL_FIND" -P "$gc_root/app-wt" -exec touch -h -d '2 hours ago' {} +
+printf '[]\n' >"$fixture/gc-agents.json"
+exec 7>"$XDG_STATE_HOME/claude-hq/janitor.lock"
+flock -n 7
+gc_reset
+out=$(HQ_ROOTS="$gc_root" AGENTS_FILE="$fixture/gc-agents.json" ROOT_DISK_PCT=85 hq gc --apply)
+contains "$out" 'skip worktrees: janitor running: 1'
+[[ -d $gc_root/app-wt/clean ]] || fail 'gc removed worktrees while janitor held its lock'
+exec 7>&-
+out=$(HQ_ROOTS="$gc_root" AGENTS_FILE="$fixture/gc-agents.json" ROOT_DISK_PCT=85 hq gc --apply -v)
+contains "$out" "applied: remove merged worktree $gc_root/app-wt/clean"
+[[ ! -e $gc_root/app-wt/clean ]] || fail 'gc kept clean merged worktree'
+for name in locked busy dirty ahead; do [[ -d $gc_root/app-wt/$name ]] || fail "gc removed $name worktree"; done
+git -C "$gc_root/app" show-ref --verify --quiet refs/heads/so/ahead || fail 'gc deleted unmerged branch'
+rm -f "$HQ_PROC_ROOT/777777/cwd"
+# The janitor timer path runs gc after janitor --apply.
+out=$(HQ_ROOTS="$gc_root" AGENTS_FILE="$fixture/gc-agents.json" ROOT_DISK_PCT=20 hq janitor --apply)
+contains "$out" 'Janitor apply'
+contains "$out" 'GC skipped: disk 20% < 70%'
+ok 'gc worktrees: dirty/ahead/locked/busy kept, janitor lock respected, janitor --apply runs gc'
+
 # Profile every command using fixture data; spawn/stop never reach a real session.
-for action in projects sessions cleanup health capacity brief janitor memory spawn stop; do
+for action in projects sessions cleanup health capacity brief janitor gc memory spawn stop; do
   args=("$action")
   case $action in memory) args+=(check) ;; spawn) args+=(p0 --force -- profile) ;; stop) args+=(stress-0) ;; esac
   started_ns=$(date +%s%N)

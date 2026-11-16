@@ -7,7 +7,7 @@ scan_repos() {
   if [[ ${HQ_JANITOR_CONTEXT:-0} == 1 && -n ${JANITOR_LOG:-} ]]; then scan_base=${JANITOR_LOG%/*}; fi
   scan_dir=$(external mktemp -d "$scan_base/hq-scan.XXXXXX")
   if [[ $HQ_ACTION == janitor ]]; then
-    jq -r '.[]|select(.state!="done" and .state!="completed" and .state!="stopped")|.cwd // empty' <<<"$ALL_AGENTS" >"$scan_dir/live-cwds"
+    printf '%s\n' "${LIVE_CWDS[@]}" >"$scan_dir/live-cwds"
   fi
   if (( ${#REPOS[@]} )); then
     if ! printf '%s\0' "${REPOS[@]}" | HQ_SCAN_MODE=$HQ_ACTION HQ_WORKTREE_SCAN_SECONDS=$scan_seconds external xargs -0 -r -P 4 -n 1 \
@@ -25,7 +25,7 @@ scan_repos() {
 
 repo_row() {
   local output_dir=$1 dir=$2 temp branch='(unborn)' dirty=0 ahead=0 behind=0 stamp age=null base='' field oid=''
-  local wt='' wtbranch='' commit='' wt_dirty merged recent status refs='' ref_name ref_commit cwd live
+  local wt='' wtbranch='' commit='' wtlocked=false wt_dirty merged recent status refs='' ref_name ref_commit cwd live
   local mode=${HQ_SCAN_MODE:-cleanup}
   local -a wt_fields=() live_cwds=()
   local -A merged_refs=()
@@ -69,6 +69,7 @@ repo_row() {
         'worktree '*) wt=${field#worktree } ;;
         'branch '*) wtbranch=${field#branch refs/heads/} ;;
         'HEAD '*) commit=${field#HEAD } ;;
+        'locked'*) wtlocked=true ;;
         '')
           if [[ -n $wt && -d $wt && ! -L $wt ]]; then
             wt_dirty=-1; merged=false; recent=true; live=false
@@ -76,6 +77,8 @@ repo_row() {
             else
               if [[ -n $wtbranch && ${merged_refs[$wtbranch]:-} == "$commit" ]]; then merged=true
               elif [[ -z $wtbranch && -n $base ]] && git -C "$dir" merge-base --is-ancestor "$commit" "$base" 2>/dev/null; then merged=true; fi
+              # Locked worktrees are never janitor candidates.
+              live=$wtlocked
               for cwd in "${live_cwds[@]}"; do
                 if [[ $cwd == "$wt" || $cwd == "$wt/"* ]]; then live=true; break; fi
               done
@@ -92,7 +95,7 @@ repo_row() {
             fi
             wt_fields+=("$wt" "$wtbranch" "$commit" "$wt_dirty" "$merged" "$recent")
           fi
-          wt=''; wtbranch=''; commit='' ;;
+          wt=''; wtbranch=''; commit=''; wtlocked=false ;;
       esac
     done < <(git -C "$dir" worktree list --porcelain -z)
   fi
