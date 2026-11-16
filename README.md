@@ -197,11 +197,15 @@ skips this gate only.
 
 | Target | Rule |
 |---|---|
-| `$XDG_CACHE_HOME/go-build` (default `~/.cache`) | Removed whole; Go rebuilds it |
+| `$XDG_CACHE_HOME/go-build` (default `~/.cache`) | Entries unused for `HQ_GC_GO_AGE_H` (24; Go refreshes mtime on use) are trimmed; the whole cache is wiped only if still over `HQ_GC_GO_GB`, since a wipe forces slow cgo rebuilds |
 | `$XDG_CACHE_HOME/*-target` | Removed when nothing inside changed for `HQ_GC_IDLE_MINUTES` (60) |
 | `$XDG_CACHE_HOME/tmp/go-build*` | Same idle rule |
 | Docker | `docker builder prune -f`, `docker image prune -f` (dangling only; never volumes) |
 | Worktrees in HQ_ROOTS projects | The janitor's rule: clean, merged into the default branch, unlocked, idle `HQ_WORKTREE_HOURS`, and not the cwd of any process |
+
+Every run, gated or not, also reports (never kills) orphaned processes: PPID 1,
+up at least `HQ_GC_ORPHAN_HOURS` (6) and at least `HQ_GC_ORPHAN_CPU` (80) % CPU,
+such as a stray `superorchestrator tui`.
 
 Build caches are skipped entirely while any `cargo`, `rustc`, `go build|test|run|install|vet|generate`,
 or `docker [compose|buildx] build` process of the user runs. Symlinks are never

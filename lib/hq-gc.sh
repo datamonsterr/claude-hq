@@ -42,6 +42,39 @@ gc_dir() {
   janitor_action "$summary $path ($(gc_human "$kb"))" gc_remove_dir "$path" || true
 }
 
+# Go refreshes an entry's mtime when a build uses it, so age is "unused for".
+gc_go_old() {
+  command timeout --kill-after=1 600 find -P "$1" -mindepth 2 -maxdepth 2 -type f \
+    -mmin "+$((${HQ_GC_GO_AGE_H:-24}*60))" "${@:2}"
+}
+
+# Trim entries unused for HQ_GC_GO_AGE_H; wipe only if still over HQ_GC_GO_GB,
+# because a full wipe forces slow cgo rebuilds for every project.
+gc_go_cache() {
+  local dir=$GC_CACHE/go-build total old rest
+  [[ -d $dir && ! -L $dir ]] || return 0
+  total=$(gc_size_kb "$dir")
+  old=$(gc_go_old "$dir" -printf '%k\n' 2>/dev/null | external awk '{s+=$1} END{print s+0}')
+  GC_PLANNED_KB=$((GC_PLANNED_KB+old))
+  janitor_action "trim go build cache $dir ($(gc_human "$old") of $(gc_human "$total"))" gc_go_old "$dir" -delete || true
+  if $JANITOR_APPLY; then rest=$(gc_size_kb "$dir"); else rest=$((total-old)); fi
+  if (( rest > ${HQ_GC_GO_GB:-10}*1048576 )); then
+    GC_PLANNED_KB=$((GC_PLANNED_KB+rest))
+    janitor_action "clear go build cache $dir ($(gc_human "$rest") > ${HQ_GC_GO_GB:-10}G after trim)" gc_remove_dir "$dir" || true
+  fi
+}
+
+# Report only: long-running orphans (PPID 1) burning CPU, e.g. stray TUIs.
+gc_orphans() {
+  local pid ppid secs cpu cmd
+  while read -r pid ppid secs cpu cmd; do
+    [[ $ppid == 1 && $secs =~ ^[0-9]+$ ]] || continue
+    (( secs >= ${HQ_GC_ORPHAN_HOURS:-6}*3600 )) || continue
+    (( ${cpu%.*} >= ${HQ_GC_ORPHAN_CPU:-80} )) || continue
+    printf 'orphan (report only, not killed): pid %s cpu %s%% up %sh: %s\n' "$pid" "$cpu" $((secs/3600)) "${cmd:0:100}"
+  done < <(external ps -u "$(id -u)" -o pid=,ppid=,etimes=,pcpu=,args= 2>/dev/null)
+}
+
 gc_caches() {
   local path builds
   if builds=$(gc_active_builds); then
@@ -50,9 +83,7 @@ gc_caches() {
     done <<<"$builds"
     return 0
   fi
-  if [[ -d $GC_CACHE/go-build && ! -L $GC_CACHE/go-build ]]; then
-    gc_dir 'clear go build cache' "$GC_CACHE/go-build"
-  fi
+  gc_go_cache
   for path in "$GC_CACHE"/*-target "$GC_CACHE"/tmp/go-build*; do
     [[ -d $path && ! -L $path ]] || continue
     if ! gc_idle "$path"; then
@@ -76,7 +107,7 @@ gc_worktrees() {
 }
 
 gc() {
-  local apply=false verbose=false force=false used_before state_dir go_kb=-1 reason
+  local apply=false verbose=false force=false used_before state_dir go_kb=-1 reason key
   local -a args=(gc)
   while (( $# )); do
     case $1 in
@@ -94,8 +125,9 @@ gc() {
     exec timeout --kill-after=10 "${HQ_GC_TIMEOUT:-900}" nice -n 19 ionice -c3 \
       env HQ_JANITOR_CONTEXT=1 "$HQ_DIR/bin/hq" "${args[@]}"
   fi
-  [[ ${HQ_GC_DISK_PCT:-70} =~ ^[0-9]+$ && ${HQ_GC_GO_GB:-10} =~ ^[0-9]+$ && ${HQ_GC_IDLE_MINUTES:-60} =~ ^[0-9]+$ ]] ||
-    die 'HQ_GC_DISK_PCT, HQ_GC_GO_GB and HQ_GC_IDLE_MINUTES must be nonnegative integers'
+  for key in HQ_GC_DISK_PCT HQ_GC_GO_GB HQ_GC_GO_AGE_H HQ_GC_IDLE_MINUTES HQ_GC_ORPHAN_HOURS HQ_GC_ORPHAN_CPU; do
+    [[ ${!key:-0} =~ ^[0-9]+$ ]] || die "$key must be a nonnegative integer"
+  done
   GC_CACHE=${XDG_CACHE_HOME:-$HOME/.cache}
   [[ ! -L $GC_CACHE ]] || die 'refusing symlinked cache directory'
   GC_CUTOFF=$((NOW-${HQ_GC_IDLE_MINUTES:-60}*60))
@@ -109,6 +141,7 @@ gc() {
     else
       printf 'GC skipped: disk %s%% < %s%%; go-build %s <= %sG\n' "$DISK_USE" "${HQ_GC_DISK_PCT:-70}" \
         "$(if (( go_kb >= 0 )); then gc_human "$go_kb"; else printf none; fi)" "${HQ_GC_GO_GB:-10}"
+      gc_orphans
       return 0
     fi
   fi
@@ -131,6 +164,7 @@ gc() {
   gc_caches
   gc_worktrees
   report_render
+  gc_orphans
   if $apply; then
     disk_sample /
     reason="freed $(gc_human $((used_before > DISK_USED_KB ? used_before-DISK_USED_KB : 0))) (disk now ${DISK_USE}%)"

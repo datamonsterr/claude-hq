@@ -41,7 +41,8 @@ report_action() {
     'delete merged branch '*) rule=branches; label='delete merged branches' ;;
     'remove stale Claude temp '*) rule=scratch; label='remove stale Claude temp directories' ;;
     'remove old tmpfs file '*) rule=tmpfs; label='remove old tmpfs files' ;;
-    'clear go build cache '*) rule=gocache; label='clear Go build cache' ;;
+    'trim go build cache '*) rule=gotrim; label="trim Go build cache entries unused >${HQ_GC_GO_AGE_H:-24}h" ;;
+    'clear go build cache '*) rule=gocache; label="clear Go build cache (over ${HQ_GC_GO_GB:-10}G after trim)" ;;
     'remove stale build target '*) rule=targets; label="remove build targets idle >${HQ_GC_IDLE_MINUTES:-60}m" ;;
     'remove stale go temp '*) rule=gotmp; label="remove Go temp dirs idle >${HQ_GC_IDLE_MINUTES:-60}m" ;;
     'docker '*) rule=docker; label='docker prune (build cache, dangling images; never volumes)' ;;

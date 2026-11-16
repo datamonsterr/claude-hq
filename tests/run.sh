@@ -131,6 +131,10 @@ exit 0
 STUB
 export DOCKER_LOG=$fixture/docker-calls
 : >"$DOCKER_LOG"
+cat >"$fixture/stubs/ps" <<'STUB'
+#!/usr/bin/env bash
+[[ -z ${PS_ROWS:-} ]] || printf '%s\n' "$PS_ROWS"
+STUB
 cat >"$fixture/stubs/pgrep" <<'STUB'
 #!/usr/bin/env bash
 [[ -n ${BUILD_PROCS:-} ]] || exit 1
@@ -673,9 +677,11 @@ cache=$XDG_CACHE_HOME
 gc_root=$HOME/gc-projects
 gc_reset() {
   rm -rf -- "$cache" "$fixture/outside"
-  mkdir -p "$cache/go-build/00" "$cache/old-target/debug" "$cache/fresh-target" "$cache/tmp/go-build111/b001" \
+  mkdir -p "$cache/go-build/00" "$cache/go-build/01" "$cache/old-target/debug" "$cache/fresh-target" "$cache/tmp/go-build111/b001" \
     "$cache/tmp/go-build222" "$cache/keep" "$fixture/outside/linked-target"
   head -c 8192 /dev/zero >"$cache/go-build/00/entry-d"
+  head -c 8192 /dev/zero >"$cache/go-build/01/unused-d"
+  touch -d '30 hours ago' "$cache/go-build/01/unused-d"
   printf 'x\n' | tee "$cache/old-target/debug/bin" "$cache/fresh-target/bin" "$cache/tmp/go-build111/b001/a" \
     "$cache/tmp/go-build222/a" "$cache/keep/file" "$fixture/outside/linked-target/file" >/dev/null
   ln -s "$fixture/outside/linked-target" "$cache/linked-target"
@@ -683,7 +689,7 @@ gc_reset() {
   : >"$DOCKER_LOG"
 }
 gc_untouched() {
-  [[ -f $cache/go-build/00/entry-d && -d $cache/old-target && -d $cache/tmp/go-build111 ]] || fail "$1"
+  [[ -f $cache/go-build/00/entry-d && -f $cache/go-build/01/unused-d && -d $cache/old-target && -d $cache/tmp/go-build111 ]] || fail "$1"
 }
 gc_reset
 out=$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=50 hq gc --apply)
@@ -692,6 +698,7 @@ gc_untouched 'gc below thresholds deleted caches'
 [[ ! -s $DOCKER_LOG ]] || fail 'gated gc called docker'
 out=$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=50 HQ_GC_GO_GB=0 hq gc)
 contains "$out" 'GC dry-run · go-build'
+contains "$out" "plan: trim go build cache $cache/go-build ("
 contains "$out" "plan: clear go build cache $cache/go-build"
 contains "$out" "plan: remove stale build target $cache/old-target"
 contains "$out" "plan: remove stale go temp $cache/tmp/go-build111"
@@ -709,14 +716,24 @@ gc_untouched 'gc deleted caches during a build'
 [[ ! -s $DOCKER_LOG ]] || fail 'gc touched docker during a build'
 out=$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=85 hq gc --apply)
 contains "$out" 'GC apply · disk 85% >= 70%'
-contains "$out" "applied: clear go build cache $cache/go-build"
+contains "$out" "applied: trim go build cache $cache/go-build"
+[[ $out != *'clear go build cache'* ]] || fail 'gc wiped go-build under the size cap' 
 contains "$out" 'GC freed'
-[[ ! -e $cache/go-build && ! -e $cache/old-target && ! -e $cache/tmp/go-build111 ]] || fail 'gc kept stale caches'
+[[ -f $cache/go-build/00/entry-d && ! -e $cache/go-build/01/unused-d ]] || fail 'gc did not trim only unused go-build entries'
+[[ ! -e $cache/old-target && ! -e $cache/tmp/go-build111 ]] || fail 'gc kept stale caches'
 [[ -f $cache/fresh-target/bin && -f $cache/tmp/go-build222/a && -f $cache/keep/file ]] || fail 'gc removed recent or unrelated dirs'
 [[ -L $cache/linked-target && -f $fixture/outside/linked-target/file ]] || fail 'gc followed a symlinked target'
 [[ $(cat "$DOCKER_LOG") == $'info\nbuilder prune -f\nimage prune -f' ]] || fail "gc docker calls: $(cat "$DOCKER_LOG")"
 contains "$(cat "$XDG_STATE_HOME/claude-hq/janitor.log")" 'gc freed'
 contains "$(cat "$TIMEOUT_LOG")" '900 nice -n 19 ionice -c3 env HQ_JANITOR_CONTEXT=1'
+gc_reset
+out=$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=85 HQ_GC_GO_GB=0 hq gc --apply)
+contains "$out" "applied: clear go build cache $cache/go-build"
+[[ ! -e $cache/go-build ]] || fail 'gc kept go-build over the size cap after trim'
+out=$(PS_ROWS=$'4001 1 90000 99.5 superorchestrator tui --config-dir x\n4002 1 600 99.0 fresh-orphan\n4003 77 90000 99.0 child\n4004 1 90000 3.0 idle-daemon' \
+  HQ_ROOTS="$gc_root" ROOT_DISK_PCT=50 hq gc)
+contains "$out" 'orphan (report only, not killed): pid 4001 cpu 99.5% up 25h: superorchestrator tui'
+[[ $out != *4002* && $out != *4003* && $out != *4004* ]] || fail 'gc reported young, parented or idle processes'
 gc_reset
 DOCKER_DOWN=1 HQ_ROOTS="$gc_root" ROOT_DISK_PCT=85 hq gc --apply >/dev/null
 [[ $(cat "$DOCKER_LOG") == info ]] || fail 'gc pruned with docker unavailable'
@@ -726,7 +743,7 @@ gc_reset
 contains "$(HQ_ROOTS="$gc_root" ROOT_DISK_PCT=85 hq gc --apply)" 'gc: another run holds the lock'
 gc_untouched 'locked gc deleted caches'
 exec 7>&-
-ok 'gc: disk/go-build gate, dry-run, build guard, stale-only caches, symlinks, docker, lock, log'
+ok 'gc: gate, dry-run, build guard, go-build trim then cap wipe, stale-only targets, symlinks, docker, orphans, lock, log'
 
 # gc worktrees: only clean + merged + unlocked + idle + not used by any process.
 init_repo "$gc_root/app"
